@@ -1,14 +1,14 @@
 # claude-code-slack
 
-## Main Functions
+## 🔵 Main Functions
 - To control a Claude Code agent running in a server's tmux session
 - To make direct Anthropic API calls to the Claude model — independent of the tmux session — for one-off tasks and questions.
 
-## Requirements
+## 🔵 Requirements
 - A personal Slack workspace (Free Edition also works!)
 - A custom Slack bot (files in **`manual/`** explains detailed guidelines to make this bot) 
 
-## Repository Structure
+## 🔵 Repository Structure
 
 ```
 claude-code-slack/
@@ -72,7 +72,7 @@ See `manual/claude-slack-manual-{EN,KO}.pptx` for the full Slack app setup walkt
 
 ---
 
-## Detailed Explanation of Functions
+## 📝 Detailed Explanation of Functions
 
 ![A brief overview of entire framework](assets/overview.png)
 
