@@ -44,7 +44,7 @@ Visual, slide-by-slide setup walkthroughs. Identical content in two languages.
 #### `assets/`
 Images referenced by `README.md`.
 
-- **`overview.png`** — The architecture diagram shown at the top of the README.
+- **`overview.png`** — The architecture diagram.
 
 ## Running from this repo
 
