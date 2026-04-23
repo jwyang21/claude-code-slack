@@ -74,6 +74,8 @@ See `manual/claude-slack-manual-{EN,KO}.pptx` for the full Slack app setup walkt
 
 ## 📝 Detailed Explanation of Functions
 
+![A brief overview of entire framework](assets/overview.png)
+
 ### Two Ways the Bot Talks to Claude
 
 This bot uses a personal Slack workspace and a custom Slack app to interact with Claude through **two completely separate paths**. Understanding the distinction matters — they behave differently and are useful for different things.
