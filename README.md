@@ -1,5 +1,11 @@
 # claude-code-slack
 
+## TL;DR
+
+Creating a slack bot which lets you (1) interact with a **tmux-resident Claude Code agent** that retains full session state, and (2) make **stateless Claude API calls** for ad-hoc tasks and questions — independent of the tmux session.
+
+---
+
 ![A brief overview of entire framework](assets/overview.png)
 
 ## Main Functions
@@ -110,9 +116,3 @@ How far along is the experiment?
 ```
 
 the bot forwards those keystrokes straight into the tmux session. The Claude Code agent running there receives the question with all of its running context (scripts, logs, open files) and can give a real, grounded answer.
-
----
-
-## One-line summary
-
-The bot lets you (1) interact with a **tmux-resident Claude Code agent** that retains full session state, and (2) make **stateless Claude API calls** for ad-hoc tasks and questions — independent of the tmux session.
