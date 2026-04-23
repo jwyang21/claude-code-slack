@@ -23,6 +23,7 @@ claude-code-slack/
 │   ├── .env                          # Your tokens (see security note below)
 │   ├── index.js                      # Main bot code — all Slack handlers, tmux control, API calls
 │   └── package.json                  # npm dependencies and start script
+├── .gitignore                        # Specifies files and directories to be ignored by Git
 ├── LICENSE                           # MIT license
 └── README.md                         # This file
 ```
@@ -66,7 +67,15 @@ npm start
 
 See `manual/claude-slack-manual-{EN,KO}.pptx` for the full Slack app setup walkthrough.
 
-## Detailed Explanation
+
+## Security Note
+- Never commit your `.env` file — it contains sensitive tokens
+- Copy `.env.example` to `.env` and fill in your own credentials
+- `.gitignore` is preconfigured to exclude `.env` and `node_modules/`
+
+---
+
+## Detailed Explanation of Functions
 ### Two Ways the Bot Talks to Claude
 
 This bot uses a personal Slack workspace and a custom Slack app to interact with Claude through **two completely separate paths**. Understanding the distinction matters — they behave differently and are useful for different things.
