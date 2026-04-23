@@ -8,7 +8,7 @@
 
 ## Requirements
 - A personal Slack workspace (Free Edition also works!)
-- A custom Slack bot (files in manual/ explains detailed guidelines to make this bot) 
+- A custom Slack bot (files in **`manual/`** explains detailed guidelines to make this bot) 
 
 ## Detailed Explanation
 ### Two Ways the Bot Talks to Claude
