@@ -1,13 +1,5 @@
 # claude-code-slack
 
-## TL;DR
-
-Creating a slack bot which lets you (1) interact with a **tmux-resident Claude Code agent** that retains full session state, and (2) make **stateless Claude API calls** for ad-hoc tasks and questions — independent of the tmux session.
-
----
-
-![A brief overview of entire framework](assets/overview.png)
-
 ## Main Functions
 - To control a Claude Code agent running in a server's tmux session
 - To make direct Anthropic API calls to the Claude model — independent of the tmux session — for one-off tasks and questions.
@@ -81,6 +73,9 @@ See `manual/claude-slack-manual-{EN,KO}.pptx` for the full Slack app setup walkt
 ---
 
 ## Detailed Explanation of Functions
+
+![A brief overview of entire framework](assets/overview.png)
+
 ### Two Ways the Bot Talks to Claude
 
 This bot uses a personal Slack workspace and a custom Slack app to interact with Claude through **two completely separate paths**. Understanding the distinction matters — they behave differently and are useful for different things.
