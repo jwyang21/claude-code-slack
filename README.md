@@ -42,7 +42,7 @@ PPT slides: Visual, slide-by-slide setup walkthroughs. Identical content in two 
 
 - **`claude-slack-manual-EN.pptx`** — English version. 19 slides covering Slack app creation, token generation, server installation, running the bot, and feature usage.
 - **`claude-slack-manual-KO.pptx`** — Korean version of the same manual.
-- **`index_commented.js`** — Main bot code (src/index.js) with Korean comments. Created by claude-code
+- **`index_commented.js`** — Main bot code (src/index.js) with Korean comments. Created by Claude
 
 #### `assets/`
 Image files used in README.md
