@@ -19,9 +19,9 @@ claude-code-slack/
 ├── manual/
 │   ├── claude-slack-manual-EN.pptx   # Step-by-step setup guide (English)
 │   └── claude-slack-manual-KO.pptx   # Step-by-step setup guide (Korean)
+│   └── index_commented.js            # Main bot code (src/index.js) with Korean comments. Created by claude-code
 ├── assets/
 │   └── overview.png                  # Architecture diagram used in the README
-│   └── index_commented.js            # Main bot code (src/index.js) with Korean comments. Created by claude-code
 ├── .gitignore                        # Specifies files and directories to be ignored by Git
 ├── LICENSE                           # MIT license
 └── README.md                         # This file
@@ -37,14 +37,15 @@ The runnable bot. Everything needed to start the bot lives here.
 - **`.env`** — Holds the three secret tokens (`SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`, `ANTHROPIC_API_KEY`) that the bot reads on startup.
 
 #### `manual/`
-Visual, slide-by-slide setup walkthroughs. Identical content in two languages.
+PPT slides: Visual, slide-by-slide setup walkthroughs. Identical content in two languages.         
+.js file: Main bot code (src/index.js) with detailed comments.
 
 - **`claude-slack-manual-EN.pptx`** — English version. 19 slides covering Slack app creation, token generation, server installation, running the bot, and feature usage.
 - **`claude-slack-manual-KO.pptx`** — Korean version of the same manual.
+- **`index_commented.js`** — Main bot code (src/index.js) with Korean comments. Created by claude-code
 
 #### `assets/`
-- **`overview.png`** — The overall architecture.
-- **`index_commented.js`** — Main bot code (src/index.js) with Korean comments. Created by claude-code
+Image files used in README.md
 
 - **`overview.png`** — The architecture diagram.
 
