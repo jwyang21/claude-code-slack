@@ -515,7 +515,15 @@ function getTmuxTarget(sessionId) {
 }
 
 function tmuxSend(text) {
-  execSync(`tmux send-keys -t ${getTmuxTarget(currentTmuxSession)} ${JSON.stringify(text)} Enter`);
+  const target = getTmuxTarget(currentTmuxSession);
+  // 1. Send the text as literal characters (-l ensures special chars like apostrophes,
+  //    Korean, etc. are transmitted verbatim without tmux trying to interpret them).
+  execSync(`tmux send-keys -t ${target} -l ${JSON.stringify(text)}`);
+  // 2. Give Claude Code's TUI a moment to fully receive the text before we press Enter.
+  //    Without this pause, Enter can arrive mid-paste and the input gets stuck in the box.
+  execSync(`sleep 0.3`);
+  // 3. Now send Enter as a separate key event so Claude Code treats it as "submit".
+  execSync(`tmux send-keys -t ${target} Enter`);
 }
 
 function tmuxCapture() {
