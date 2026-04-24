@@ -19,7 +19,7 @@ claude-code-slack/
 ├── manual/
 │   ├── claude-slack-manual-EN.pptx   # Step-by-step setup guide (English)
 │   └── claude-slack-manual-KO.pptx   # Step-by-step setup guide (Korean)
-│   └── index_commented.js            # Main bot code (src/index.js) with Korean comments. Created by Claude.
+│   └── index_commented.js            # Main bot code (src/index.js) with comments. Created by Claude.
 ├── assets/
 │   └── overview.png                  # Architecture diagram used in the README
 ├── .gitignore                        # Specifies files and directories to be ignored by Git
@@ -42,7 +42,7 @@ PPT slides: Visual, slide-by-slide setup walkthroughs. Identical content in two 
 
 - **`claude-slack-manual-EN.pptx`** — English version. 19 slides covering Slack app creation, token generation, server installation, running the bot, and feature usage.
 - **`claude-slack-manual-KO.pptx`** — Korean version of the same manual.
-- **`index_commented.js`** — Main bot code (src/index.js) with Korean comments. Created by Claude.
+- **`index_commented.js`** — Main bot code (src/index.js) with comments. Created by Claude.
 
 #### `assets/`
 Image files used in README.md
