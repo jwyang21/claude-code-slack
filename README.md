@@ -19,7 +19,7 @@ claude-code-slack/
 ├── manual/
 │   ├── claude-slack-manual-EN.pptx   # Step-by-step setup guide (English)
 │   └── claude-slack-manual-KO.pptx   # Step-by-step setup guide (Korean)
-│   └── index_commented.js            # Main bot code (src/index.js) with Korean comments. Created by claude-code
+│   └── index_commented.js            # Main bot code (src/index.js) with Korean comments. Created by claude
 ├── assets/
 │   └── overview.png                  # Architecture diagram used in the README
 ├── .gitignore                        # Specifies files and directories to be ignored by Git
