@@ -1,14 +1,11 @@
 {
   "name": "claude-slack-bridge",
   "version": "1.0.0",
-  "scripts": {
-    "start": "node index.js"
-  },
+  "type": "commonjs",
+  "scripts": { "start": "node index.js" },
   "dependencies": {
-    "@anthropic-ai/claude-code": "^2.1.80",
     "@anthropic-ai/sdk": "^0.80.0",
     "@slack/bolt": "^3.19.0",
-    "dotenv": "^16.4.5",
-    "node-abort-controller": "^3.1.1"
+    "dotenv": "^16.4.5"
   }
 }
