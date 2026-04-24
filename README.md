@@ -12,16 +12,16 @@
 
 ```
 claude-code-slack/
-├── assets/
-│   └── overview.png                  # Architecture diagram used in the README
-│   └── index_commented.js            # Main bot code (src/index.js) with Korean comments. Created by claude-code
-├── manual/
-│   ├── claude-slack-manual-EN.pptx   # Step-by-step setup guide (English)
-│   └── claude-slack-manual-KO.pptx   # Step-by-step setup guide (Korean)
 ├── src/
 │   ├── .env                          # Your tokens (see security note below)
 │   ├── index.js                      # Main bot code — all Slack handlers, tmux control, API calls
 │   └── package.json                  # npm dependencies and start script
+├── manual/
+│   ├── claude-slack-manual-EN.pptx   # Step-by-step setup guide (English)
+│   └── claude-slack-manual-KO.pptx   # Step-by-step setup guide (Korean)
+├── assets/
+│   └── overview.png                  # Architecture diagram used in the README
+│   └── index_commented.js            # Main bot code (src/index.js) with Korean comments. Created by claude-code
 ├── .gitignore                        # Specifies files and directories to be ignored by Git
 ├── LICENSE                           # MIT license
 └── README.md                         # This file
@@ -43,7 +43,8 @@ Visual, slide-by-slide setup walkthroughs. Identical content in two languages.
 - **`claude-slack-manual-KO.pptx`** — Korean version of the same manual.
 
 #### `assets/`
-Images referenced by `README.md`.
+- **`overview.png`** — The overall architecture.
+- **`index_commented.js`** — Main bot code (src/index.js) with Korean comments. Created by claude-code
 
 - **`overview.png`** — The architecture diagram.
 
