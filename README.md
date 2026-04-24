@@ -14,6 +14,7 @@
 claude-code-slack/
 ├── assets/
 │   └── overview.png                  # Architecture diagram used in the README
+│   └── index_commented.js            # Main bot code (src/index.js) with Korean comments. Created by claude-code
 ├── manual/
 │   ├── claude-slack-manual-EN.pptx   # Step-by-step setup guide (English)
 │   └── claude-slack-manual-KO.pptx   # Step-by-step setup guide (Korean)
