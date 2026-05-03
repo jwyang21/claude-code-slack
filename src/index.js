@@ -9,7 +9,7 @@ dotenv.config();
 
 // ─── Model configuration ─────────────────────────────────────────────────────
 // Change this value to switch Claude models across the entire file.
-const MODEL = "claude-opus-4-6";
+const MODEL = "claude-opus-4-7";
 
 const anthropic = new Anthropic.default({ apiKey: process.env.ANTHROPIC_API_KEY });
 const app = new App({ token: process.env.SLACK_BOT_TOKEN, appToken: process.env.SLACK_APP_TOKEN, socketMode: true });
@@ -148,6 +148,9 @@ async function startTmuxPolling(client) {
   lastTmuxOutput = "";
   awaitingPermission = false;
   let awaitingPermissionSince = null;
+  let reminderSent = false;       // True once we've sent the one-shot reminder
+                                  // for the current prompt. Reset to false when
+                                  // the prompt disappears or is replaced.
   let claudeWasWorking = false;
   let responseStartOutput = "";
 
@@ -167,10 +170,18 @@ async function startTmuxPolling(client) {
     if (awaitingPermission && !detectPermissionRequest(output)) {
       awaitingPermission = false;
       awaitingPermissionSince = null;
+      reminderSent = false;     // Reset for next prompt
     }
 
-    // Send reminder every 5 minutes if still awaiting response
-    if (awaitingPermission && awaitingPermissionSince) {
+    // Send reminder ONCE after 5 minutes if still awaiting response.
+    // We deliberately do NOT keep sending repeated reminders, because
+    // some claude-code outputs contain numbered lists ("1. ..., 2. ...")
+    // that match our permission patterns even though no real permission
+    // is being requested. In that case the on-screen text never changes
+    // and the user can't dismiss it from Slack — repeated reminders just
+    // become noise. One reminder is enough to alert the user; if it's a
+    // false alarm they can ignore it; if it's real they can respond.
+    if (awaitingPermission && awaitingPermissionSince && !reminderSent) {
       if (Date.now() - awaitingPermissionSince > 300000) {
         await client.chat.postMessage({
           channel: tmuxStreamChannel,
@@ -178,7 +189,7 @@ async function startTmuxPolling(client) {
           text: "⏰ *Reminder — Claude is still waiting for your response:*",
           blocks: buildPermissionBlocks(lastTmuxOutput),
         });
-        awaitingPermissionSince = Date.now();
+        reminderSent = true;    // Mark as sent — no more reminders for this prompt
       }
     }
 
@@ -228,6 +239,7 @@ async function startTmuxPolling(client) {
     if (!awaitingPermission && !echoSuppress && detectPermissionRequest(output)) {
       awaitingPermission = true;
       awaitingPermissionSince = Date.now();
+      reminderSent = false;     // Fresh prompt → enable reminder again
 
       if (tmuxLiveMsgTs) {
         try {

@@ -75,6 +75,15 @@
 //       Enter to actually submit. Single-line input still uses the simpler
 //       one-Enter path.
 //
+//    7. One-shot reminder: when a permission prompt is detected and the user
+//       doesn't respond within 5 minutes, send ONE reminder — not a recurring
+//       alert every 5 minutes. The recurring version was useful for real
+//       prompts but became noise when a false alarm fired (e.g. claude-code's
+//       answer contained "1. ... 2. ..." text that matches a pattern). Such
+//       pseudo-prompts never disappear from the screen, so the recurring
+//       reminder kept firing forever. With the one-shot version, the user
+//       gets one wake-up call and can ignore it if it's a false alarm.
+//
 //  ONE-MINUTE JAVASCRIPT REFRESHER
 //  --------------------------------
 //  If you don't know JavaScript, here's the minimum you need:
@@ -129,7 +138,7 @@ dotenv.config();
 // ─── 3. CONFIGURATION CONSTANTS ─────────────────────────────────────────────
 // Changing MODEL here changes which Claude model is used by EVERY API call
 // in this file. Keeping it in one place makes the value easy to swap later.
-const MODEL = "claude-opus-4-6";
+const MODEL = "claude-opus-4-7";
 
 
 // ─── 4. CREATE API CLIENTS ──────────────────────────────────────────────────
@@ -359,6 +368,22 @@ async function startTmuxPolling(client) {
   lastTmuxOutput = "";
   awaitingPermission = false;
   let awaitingPermissionSince = null;      // Timestamp when current prompt started.
+
+  // ONE-SHOT REMINDER FLAG.
+  // The reminder feature ("⏰ Claude is still waiting…") is meant to wake the
+  // user up if they missed the first notification. But Claude Code's output
+  // can contain numbered lists ("1. ..., 2. ...") that LOOK like permission
+  // options to our pattern matcher even when no real prompt is active.
+  // Such on-screen text doesn't disappear on its own, so the "still waiting"
+  // condition remains true forever. With the old logic (reset the timer
+  // every 5 min and resend), the user got an alert every 5 minutes, forever.
+  //
+  // Fix: send the reminder ONCE per prompt. After it fires, this flag is
+  // set to true and stays true until the prompt disappears (auto-reset
+  // below) or a brand-new prompt is detected. That gives the user one
+  // wake-up, then silence — they can ignore false alarms without nagging.
+  let reminderSent = false;
+
   let claudeWasWorking = false;            // (Unused — legacy variable)
   let responseStartOutput = "";            // (Unused — legacy variable)
 
@@ -383,14 +408,20 @@ async function startTmuxPolling(client) {
       .replace(/\x1b\][^\x07]*\x07/g, "");    // OSC sequences: \x1b]...BEL
     const output = stripped.trim().slice(-8000);   // Keep last 8 KB.
 
-    // If we were waiting for a permission and the prompt is gone → reset.
+    // If we were waiting for a permission and the prompt is gone → reset
+    // EVERYTHING related to this prompt, including the one-shot reminder
+    // flag. That way, if a real new prompt comes later, it can fire its
+    // own reminder.
     if (awaitingPermission && !detectPermissionRequest(output)) {
       awaitingPermission = false;
       awaitingPermissionSince = null;
+      reminderSent = false;
     }
 
-    // If still waiting and 5 minutes have elapsed → send a reminder.
-    if (awaitingPermission && awaitingPermissionSince) {
+    // ONE-SHOT REMINDER: if we're still waiting after 5 minutes and
+    // haven't already sent the reminder for this prompt, send it now
+    // and mark the flag so it never fires again for this same prompt.
+    if (awaitingPermission && awaitingPermissionSince && !reminderSent) {
       if (Date.now() - awaitingPermissionSince > 300000) {   // 300000 ms = 5 min
         await client.chat.postMessage({
           channel: tmuxStreamChannel,
@@ -398,7 +429,7 @@ async function startTmuxPolling(client) {
           text: "⏰ *Reminder — Claude is still waiting for your response:*",
           blocks: buildPermissionBlocks(lastTmuxOutput),
         });
-        awaitingPermissionSince = Date.now();              // Reset reminder timer.
+        reminderSent = true;     // No more reminders for this prompt.
       }
     }
 
@@ -424,6 +455,7 @@ async function startTmuxPolling(client) {
     if (!awaitingPermission && !echoSuppress && detectPermissionRequest(output)) {
       awaitingPermission = true;
       awaitingPermissionSince = Date.now();
+      reminderSent = false;     // New prompt → re-arm the one-shot reminder.
 
       // If a live-updating message exists, update it once more (legacy).
       if (tmuxLiveMsgTs) {
