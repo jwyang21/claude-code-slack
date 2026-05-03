@@ -14,7 +14,7 @@
 claude-code-slack/
 ├── src/
 │   ├── index.js                      # Main bot code — all Slack handlers, tmux control, API calls
-│   ├── .env                          # Your tokens (see security note below)
+│   ├── .env_example                  # An example of src/.env file (see security note below)
 │   └── package.json                  # npm dependencies and start script
 ├── manual/
 │   ├── claude-slack-manual-EN.pptx   # Step-by-step setup guide (English)
@@ -35,6 +35,7 @@ The runnable bot. Everything needed to start the bot lives here.
 - **`index.js`** — The entire bot in a single Node.js file. Handles the `/claude`, `/tmux-connect`, `/tmux`, `/tmux-status`, and `/tmux-disconnect` slash commands, routes thread replies, polls the tmux pane every 3 seconds for permission prompts, and makes streaming calls to the Anthropic API.
 - **`package.json`** — Declares three runtime dependencies (`@slack/bolt`, `@anthropic-ai/sdk`, `dotenv`) and the `start` script. Run `npm install` inside `src/` before first use.
 - **`.env`** — Holds the three secret tokens (`SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`, `ANTHROPIC_API_KEY`) that the bot reads on startup.
+    - Create src/.env file by filling up src/.env_example properly.
 
 #### `manual/`
 PPT slides: Visual, slide-by-slide setup walkthroughs. Identical content in two languages.         
@@ -59,7 +60,7 @@ cd claude-code-slack/src
 # 2. Install dependencies
 npm install
 
-# 3. Fill in .env with your three tokens
+# 3. Create src/.env with your three tokens by filling up src/.env_example with proper values
 #    (SLACK_BOT_TOKEN, SLACK_APP_TOKEN, ANTHROPIC_API_KEY)
 
 # 4. Run
@@ -70,7 +71,7 @@ See `manual/claude-slack-manual-{EN,KO}.pptx` for the full Slack app setup walkt
 
 
 ## ‼️ Security Note
-- Never commit your `.env` file — it contains sensitive tokens
+- Never commit your `src/.env` file — it contains sensitive tokens
 - `.gitignore` is preconfigured to exclude `src/.env` and `src/node_modules/`
 
 ---
