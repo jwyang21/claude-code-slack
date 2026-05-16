@@ -1,110 +1,3 @@
-// ═══════════════════════════════════════════════════════════════════════════
-//  Claude ↔ Slack Bridge — Annotated Reference Version
-// ═══════════════════════════════════════════════════════════════════════════
-//
-//  WHAT THIS FILE IS
-//  -----------------
-//  This is a fully-commented copy of src/index.js, intended as a reading
-//  reference for someone unfamiliar with the codebase (and/or with
-//  JavaScript). The actual JavaScript statements here are IDENTICAL,
-//  byte-for-byte, to src/index.js — only the comments differ. When the
-//  two files disagree, src/index.js is the source of truth.
-//
-//  WHAT THIS BOT DOES
-//  ------------------
-//  Three concurrent capabilities, all wired through a single Slack App
-//  running in Socket Mode:
-//
-//    1. /claude <task>       — Direct Anthropic API call. The bot reads
-//                              the user's request, optionally reads files
-//                              the user references, asks Claude what to
-//                              do, then executes WRITE / SHELL blocks
-//                              from the response (file edits, shell
-//                              commands, git operations).
-//
-//    2. /tmux-connect <id>   — Attaches to a tmux pane on the server.
-//                              The bot polls the pane every 3 seconds,
-//                              detects when claude-code is asking for
-//                              approval ("Do you want to proceed?", etc.),
-//                              and posts Yes/No buttons to Slack so the
-//                              user can approve from anywhere.
-//
-//    3. (background watcher) — Watches a "30-min monitoring report" file
-//                              and posts its contents to Slack whenever
-//                              it changes (drives the user's habit of
-//                              having claude-code summarize work every
-//                              30 min). Runs independently of /tmux-*.
-//
-//  RELIABILITY IMPROVEMENTS over the original draft
-//  ------------------------------------------------
-//    1. STRONG / WEAK pattern split — permission regexes are partitioned
-//       into two categories. STRONG patterns trigger detection on their
-//       own; WEAK patterns are documentation-only (currently ignored by
-//       the detector) because they also appear during normal "Thinking…".
-//
-//    2. Three overly broad patterns REMOVED outright — they fired on
-//       everyday conversation, GitHub PR text, etc.:
-//         /confirm.*\?/i, /Approve\?/i, /Allow Claude to/i
-//
-//    3. Yes/No number-list pattern TIGHTENED to "1." and "2." on
-//       CONSECUTIVE lines, not "anywhere in the buffer". Prevents matches
-//       on Claude's prose answers that contain Pros/Cons style lists.
-//
-//    4. Input echo suppression — after tmuxSend() pushes user text into
-//       the pane, permission detection is paused for ~4 seconds. Prevents
-//       echoed user input (e.g. a pasted snippet containing "[Y/n]") from
-//       firing a false alarm.
-//
-//    5. ANSI strip regex extended to include '?' in the character class —
-//       catches CSI sequences like "\x1b[?25l" (hide cursor) and
-//       "\x1b[?1049h" (alt screen) that the old regex missed.
-//
-//    6. Multi-line input handling — when the user sends a multi-line
-//       message, claude-code shows it as "[Pasted text #1 +N lines]".
-//       A single Enter only closes that placeholder. tmuxSend() now
-//       detects newlines and sends TWO Enters with a delay between.
-//
-//    7. One-shot reminder — instead of nagging the user every 5 minutes,
-//       send the "still waiting" reminder exactly ONCE per prompt.
-//       Recurring reminders became noise when false alarms fired on
-//       static pseudo-prompts that never disappear.
-//
-//    8. Periodic monitoring report (mtime-based file watcher) — separate
-//       background loop checks /home/jwyang/30-min-report.txt every
-//       30 min; if mtime changed, posts the file contents. mtime is
-//       robust against the on-screen text changing due to formatting
-//       prefixes (e.g. claude-code's "●") or partial renders.
-//
-//  ONE-MINUTE JAVASCRIPT REFRESHER
-//  --------------------------------
-//  If you don't know JavaScript, here's the minimum you need:
-//
-//    const x = 5;                    `const` = value that never changes.
-//    let   y = 10;                   `let`   = value that CAN change later.
-//    function foo(a, b) { ... }      function with positional parameters.
-//    (arg) => { ... }                arrow function = compact syntax.
-//    async function / await          async = the function may do slow work;
-//                                    await = "pause here until this finishes".
-//    const { a, b } = obj;           destructuring: pull fields out of an
-//                                    object into local variables.
-//    `hello ${name}`                 template literal with substitution.
-//    /pattern/flags                  regular expression for text matching.
-//    arr.map(fn) / arr.filter(fn)    transform / keep-some-of an array.
-//
-// ═══════════════════════════════════════════════════════════════════════════
-
-
-// ─── 1. REQUIRES (import third-party and built-in modules) ──────────────────
-//   @slack/bolt        — official Slack SDK; gives us the `App` class which
-//                        handles WebSocket connection, slash commands,
-//                        event subscriptions, and message posting.
-//   @anthropic-ai/sdk  — official Anthropic SDK; gives us a client for
-//                        the /v1/messages API (Claude completions).
-//   dotenv             — loads .env file into process.env so we can read
-//                        SLACK_BOT_TOKEN etc. without hardcoding them.
-//   fs / path          — Node.js built-ins for filesystem and path ops.
-//   child_process      — for execSync(): run shell commands synchronously
-//                        and get their output as a string.
 const { App } = require("@slack/bolt");
 const Anthropic = require("@anthropic-ai/sdk");
 const dotenv = require("dotenv");
@@ -112,53 +5,17 @@ const fs = require("fs");
 const path = require("path");
 const { execSync } = require("child_process");
 
-
-// ─── 2. LOAD .env INTO process.env ──────────────────────────────────────────
-// After this call, process.env.SLACK_BOT_TOKEN etc. are populated from the
-// .env file in the current working directory.
 dotenv.config();
 
-// ─── 3. MODEL CONFIGURATION ─────────────────────────────────────────────────
-// Change this value to switch Claude models across the entire file. Both
-// the /claude command (24000-token agent calls) and the "? <question>"
-// thread shortcut (3000-token short answers) read from this same constant.
+// ─── Model configuration ─────────────────────────────────────────────────────
+// Change this value to switch Claude models across the entire file.
 const MODEL = "claude-opus-4-7";
 
-// ─── 4. CLIENT INSTANCES + SESSION STORE ────────────────────────────────────
-//   anthropic — the Anthropic SDK client. .messages.stream(...) is how we
-//               talk to Claude. The .default is because the SDK exports
-//               are wrapped in a default export under CommonJS.
-//   app       — the Slack Bolt app. socketMode: true means we open a
-//               persistent WebSocket to Slack instead of receiving HTTP
-//               webhooks. That avoids needing a public URL for the bot.
-//   sessions  — in-memory Map keyed by "<channel>:<thread_ts>". Holds
-//               per-thread conversation history so follow-up messages
-//               continue the same context.
 const anthropic = new Anthropic.default({ apiKey: process.env.ANTHROPIC_API_KEY });
 const app = new App({ token: process.env.SLACK_BOT_TOKEN, appToken: process.env.SLACK_APP_TOKEN, socketMode: true });
 const sessions = new Map();
 
-// ─── 5. TMUX STATE (module-level variables that the bot mutates) ────────────
-//
-// All of these are GLOBAL to the bot process. They survive between Slack
-// events and slash commands. Reset to null when /tmux-disconnect runs or
-// when /tmux-connect attaches to a new target.
-//
-//   currentTmuxSession  — the session ID string the bot is currently
-//                         attached to (e.g. "5", "0:0.1"). null = not
-//                         attached, ignore tmux events.
-//   tmuxPollingActive   — boolean flag controlling the polling loop.
-//                         Set false to ask the loop to exit gracefully.
-//   tmuxStreamChannel   — Slack channel ID where /tmux-connect was run.
-//                         All tmux-related messages post here.
-//   tmuxStreamTs        — Slack timestamp (= message ID) of the anchor
-//                         message created on /tmux-connect. Used as
-//                         thread_ts so subsequent messages thread under it.
-//   tmuxLiveMsgTs       — legacy / mostly unused.
-//   lastTmuxOutput      — tmux screen content from the previous poll.
-//                         Used to skip iterations where nothing changed.
-//   awaitingPermission  — true while a permission prompt is waiting for
-//                         the user to respond. Prevents duplicate alerts.
+// ─── tmux state ───────────────────────────────────────────────────────────────
 let currentTmuxSession = null;
 let tmuxPollingActive = false;
 let tmuxStreamChannel = null;
@@ -167,48 +24,16 @@ let tmuxLiveMsgTs = null;
 let lastTmuxOutput = "";
 let awaitingPermission = false;
 
-// ─── 5b. INPUT-ECHO SUPPRESSION STATE ───────────────────────────────────────
-// When the user sends text into tmux (via /tmux command, thread reply, or
-// Slack button click), that text appears on the tmux pane. If the polling
-// loop captures the pane a moment later, it sees the user's own text on
-// screen and could mistakenly treat it as a permission request.
-// Fix: every tmuxSend() updates lastUserInputAt to the current time. The
-// polling loop checks this and skips permission detection if the input
-// happened within the last INPUT_ECHO_SUPPRESS_MS window.
-//
-// 4000 ms chosen empirically — long enough for the typed text to finish
-// appearing on screen and for claude-code's TUI to redraw, short enough
-// that real permission requests won't be suppressed for long.
+// Timestamp (ms) of the last user→tmux input. For the next ~4 seconds after
+// the user sends text into tmux, the polling loop skips permission detection.
+// This prevents the user's own input (echoed on screen) from being detected
+// as a permission prompt — e.g. if they type "이거 confirm 해야 돼?" into the
+// thread, that text appears in the pane and used to match old /confirm.*\?/i.
+// We keep this as belt-and-suspenders even after removing that pattern,
+// because user text can still trip the remaining patterns (e.g. they paste
+// a snippet containing "Do you want to proceed?").
 let lastUserInputAt = 0;
 const INPUT_ECHO_SUPPRESS_MS = 4000;
-
-// ─── 5c. PERIODIC MONITORING REPORT STATE ───────────────────────────────────
-// User has a claude-code rule that writes a 30-minute work summary to the
-// report file below. When that file gets updated (mtime changes), we post
-// its contents to the active Slack tmux thread as a notification.
-//
-// Why mtime-based instead of text-trigger based: matching specific text on
-// the tmux pane was fragile — claude-code prepends formatting characters
-// ("●", color codes, etc.) and renders gradually, so the exact text could
-// be missed or duplicated. The report file is the canonical source: when
-// it changes, exactly one update has happened, so exactly one Slack
-// notification fires.
-//
-// Behavior:
-//   - On bot start, we record the file's current mtime (or 0 if missing)
-//     and do NOT send. This avoids re-sending the same old report every
-//     time the bot restarts.
-//   - Then every 30 minutes (MONITORING_CHECK_INTERVAL_MS) we check the
-//     file's mtime. If it has changed since we last saw it, we send the
-//     file contents and update our remembered mtime.
-//   - Notifications only go out if /tmux-connect is active (we need a
-//     channel + thread to post into).
-const MONITORING_REPORT_FILE = "/home/jwyang/30-min-report.txt";
-const MONITORING_CHECK_INTERVAL_MS = 30 * 60 * 1000;   // 30 minutes
-// Last-seen mtime of the report file (ms since epoch). Initialized to 0
-// and set on the first poll (see startMonitoringPoll below). Updated each
-// time we send a new notification.
-let lastReportMtimeMs = 0;
 
 // ─── Permission prompt detection ──────────────────────────────────────────────
 //
@@ -316,29 +141,7 @@ function buildPermissionBlocks(output) {
   ];
 }
 
-// ─── 9. BACKGROUND POLLING LOOP (tmux pane watcher) ─────────────────────────
-//
-// Started by /tmux-connect, stopped by /tmux-disconnect or by attaching to
-// a different session. Runs forever inside an async loop until
-// tmuxPollingActive flips to false.
-//
-// EACH ITERATION (every 3 seconds):
-//   1. Sleep 3 seconds.
-//   2. Capture the tmux pane content via `tmux capture-pane`.
-//   3. Strip ANSI escape codes (color, cursor, etc.) for clean matching.
-//   4. (Skipped here, but used to be) trigger "30분 정기 모니터링" detection
-//      from the text — that has moved to startMonitoringPoll below.
-//   5. Check for echo suppression: did the user just send input?
-//   6. If still waiting for a permission response, check if 5 minutes
-//      have elapsed → send a one-shot reminder.
-//   7. If the output hasn't changed since last poll → skip the rest.
-//   8. Detect a new permission request: if patterns match and we're not
-//      already awaiting, post the alert with buttons.
-//
-// EXITS: the while(tmuxPollingActive) loop exits when either:
-//   - /tmux-disconnect sets the flag to false, or
-//   - /tmux-connect attaches to a new session (which first stops this one)
-//   - tmuxCapture() throws (e.g. session was killed externally)
+// ─── Background polling loop ──────────────────────────────────────────────────
 async function startTmuxPolling(client) {
   if (tmuxPollingActive) return;
   tmuxPollingActive = true;
@@ -426,11 +229,6 @@ async function startTmuxPolling(client) {
     //   responseStartOutput = "";
     // }
 
-    // Note: periodic monitoring report notifications are no longer driven
-    // from the tmux pane text. They run on their own 30-minute interval
-    // (see startMonitoringPoll below) and trigger when the report file's
-    // mtime changes — independent of whatever appears on the screen.
-
     // Detect new permission request
     // SUPPRESSION: if the user just sent input into tmux, skip detection for a
     // few seconds. Their own text appears on screen briefly and could otherwise
@@ -463,102 +261,7 @@ async function startTmuxPolling(client) {
   }
 }
 
-// ─── Periodic monitoring report poll ──────────────────────────────────────────
-// Independent of tmux polling. Every 30 minutes, checks the mtime of the
-// report file. If it's changed since the last check, reads the file and
-// posts its contents to the active /tmux-connect thread.
-//
-// Lifecycle: started once at bot boot (see the IIFE at the bottom of the
-// file). Runs forever, doesn't stop on /tmux-disconnect — it just goes
-// silent because there's no thread to post into.
-async function startMonitoringPoll(client) {
-  // On startup, record the file's CURRENT mtime as our baseline. This
-  // means: don't send the existing report on bot start; only send when
-  // the file is updated AFTER this moment.
-  try {
-    const stat = fs.statSync(MONITORING_REPORT_FILE);
-    lastReportMtimeMs = stat.mtimeMs;
-  } catch {
-    // File doesn't exist yet — that's fine, mtime stays at 0. As soon as
-    // the file appears, the first check below will fire (since any real
-    // mtime is > 0).
-    lastReportMtimeMs = 0;
-  }
-
-  while (true) {
-    // Sleep first, then check. This way the very first check happens
-    // 30 minutes after bot start, not at startup (we already set
-    // baseline above and don't want to send right away).
-    await new Promise(r => setTimeout(r, MONITORING_CHECK_INTERVAL_MS));
-
-    // Need an active /tmux-connect target. If none, just wait another 30 min.
-    if (!tmuxStreamChannel || !tmuxStreamTs) continue;
-
-    let stat;
-    try {
-      stat = fs.statSync(MONITORING_REPORT_FILE);
-    } catch {
-      // File missing — skip this cycle silently. (Don't spam errors.)
-      continue;
-    }
-
-    // File mtime unchanged → no new report → skip.
-    if (stat.mtimeMs === lastReportMtimeMs) continue;
-
-    // File has been updated since we last looked. Read and send.
-    lastReportMtimeMs = stat.mtimeMs;
-    const reportContent = readFileSafe(MONITORING_REPORT_FILE);
-
-    if (reportContent === null) {
-      // Race condition — file existed for stat but disappeared/became
-      // unreadable between stat and read. Notify and move on.
-      try {
-        await client.chat.postMessage({
-          channel: tmuxStreamChannel,
-          thread_ts: tmuxStreamTs,
-          text: `⚠️ *Monitoring report file could not be read:*\n\`${MONITORING_REPORT_FILE}\``,
-        });
-      } catch {}
-      continue;
-    }
-
-    // Slack messages are limited to ~3000 chars. Split into 2800-char
-    // chunks and send the first with a header, the rest as plain code blocks.
-    const chunks = chunkText(reportContent, 2800);
-    try {
-      await client.chat.postMessage({
-        channel: tmuxStreamChannel,
-        thread_ts: tmuxStreamTs,
-        text: `📊 *30분 정기 모니터링 리포트:*\n\`\`\`\n${chunks[0]}\n\`\`\``,
-      });
-      for (let i = 1; i < chunks.length; i++) {
-        await client.chat.postMessage({
-          channel: tmuxStreamChannel,
-          thread_ts: tmuxStreamTs,
-          text: `\`\`\`\n${chunks[i]}\n\`\`\``,
-        });
-      }
-    } catch (err) {
-      console.error("Monitoring report post failed:", err.message);
-    }
-  }
-}
-
-// ─── 10. BUTTON CLICK HANDLER (for the dynamic permission-option buttons) ───
-//
-// Fires when a user clicks a button in Slack that has an action_id like
-// "tmux_option_1_1712345678901". The regex captures the option number
-// (the first \d+). The trailing _\d+ is a per-message timestamp used to
-// keep action_ids unique across messages (Slack rejects duplicate IDs).
-//
-// To "press option N" in Claude Code's TUI, we send (N-1) DOWN arrow keys
-// to move the selection cursor, then ENTER to confirm.
-//
-// IMPORTANT: this is fundamentally different from how Y/N text prompts
-// work. For e.g. "Continue? [y/N]", pressing Enter alone confirms the
-// default (N) — clicking "1. Yes" via this handler sends 0 DOWNs + Enter,
-// which actually sends "No". For pattern-matched-as-fallback Y/N prompts
-// the user must respond in the terminal directly.
+// ─── Button: dynamic option handler (tmux_option_1, _2, _3 ...) ──────────────
 app.action(/^tmux_option_(\d+)_\d+$/, async ({ body, ack, client, action }) => {
   await ack();
   if (!currentTmuxSession) return;
@@ -868,35 +571,6 @@ function getTmuxTarget(sessionId) {
   return `${sessionId}:0.0`;
 }
 
-// ─── 14. tmuxSend — send text (and Enter) to the attached tmux pane ─────────
-//
-// MULTI-STEP DESIGN. Doing this in one shot ("send text + Enter together")
-// historically caused two problems:
-//
-//   Problem 1 (single-line):
-//     Claude Code's TUI would receive the Enter mid-paste and leave the
-//     text sitting in the input box with nothing happening.
-//   Solution:
-//     Send text with `-l` (literal) → sleep briefly → send Enter separately.
-//
-//   Problem 2 (multi-line):
-//     When the user sends a message containing newlines (e.g. a paragraph
-//     pasted from Slack), the literal text is interpreted by claude-code as
-//     a paste, and the TUI shows a collapsed "[Pasted text #1 +N lines]"
-//     placeholder. In this paste-mode UI, a single Enter often only confirms
-//     the paste (i.e. closes the placeholder) but does NOT submit the
-//     message — the user (or bot) has to press Enter a second time to
-//     actually send it.
-//   Solution:
-//     Detect newlines in the text. If multiline:
-//       - wait longer (0.8s) for the paste UI to finish settling
-//       - send Enter (closes the paste placeholder)
-//       - wait again (0.3s)
-//       - send Enter a second time (actually submits)
-//
-// After sending, we also record the current time in `lastUserInputAt` so
-// the polling loop knows to suppress permission detection for a few
-// seconds (see the echo-suppression guard in startTmuxPolling).
 function tmuxSend(text) {
   const target = getTmuxTarget(currentTmuxSession);
   const isMultiline = text.includes('\n');
@@ -1148,11 +822,6 @@ app.action("exit_session", async ({ body, ack, client }) => {
 (async () => {
   await app.start();
   console.log("⚡ Claude ↔ Slack running! (read + write + shell + tmux enabled)");
-
-  // Start the periodic monitoring report watcher. Runs in the background
-  // forever; only emits messages when a /tmux-connect target is set AND
-  // the report file's mtime has changed since the last check.
-  startMonitoringPoll(app.client);
 
   // Auto-reconnect on unexpected crash
   process.on("uncaughtException", async (err) => {

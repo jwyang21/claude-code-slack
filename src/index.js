@@ -35,6 +35,34 @@ let awaitingPermission = false;
 let lastUserInputAt = 0;
 const INPUT_ECHO_SUPPRESS_MS = 4000;
 
+// ─── Periodic monitoring report detection ────────────────────────────────────
+// User has a claude-code rule that writes a 30-minute work summary to the
+// report file below. When that file gets updated (mtime changes), we post
+// its contents to the active Slack tmux thread as a notification.
+//
+// Why mtime-based instead of text-trigger based: matching specific text on
+// the tmux pane was fragile — claude-code prepends formatting characters
+// ("●", color codes, etc.) and renders gradually, so the exact text could
+// be missed or duplicated. The report file is the canonical source: when
+// it changes, exactly one update has happened, so exactly one Slack
+// notification fires.
+//
+// Behavior:
+//   - On bot start, we record the file's current mtime (or 0 if missing)
+//     and do NOT send. This avoids re-sending the same old report every
+//     time the bot restarts.
+//   - Then every 30 minutes (MONITORING_CHECK_INTERVAL_MS) we check the
+//     file's mtime. If it has changed since we last saw it, we send the
+//     file contents and update our remembered mtime.
+//   - Notifications only go out if /tmux-connect is active (we need a
+//     channel + thread to post into).
+const MONITORING_REPORT_FILE = "/home/jwyang/30-min-report.txt";
+const MONITORING_CHECK_INTERVAL_MS = 30 * 60 * 1000;   // 30 minutes
+// Last-seen mtime of the report file (ms since epoch). Initialized to 0
+// and set on the first poll (see startMonitoringPoll below). Updated each
+// time we send a new notification.
+let lastReportMtimeMs = 0;
+
 // ─── Permission prompt detection ──────────────────────────────────────────────
 //
 // PATTERN CATEGORIES
@@ -229,6 +257,11 @@ async function startTmuxPolling(client) {
     //   responseStartOutput = "";
     // }
 
+    // Note: periodic monitoring report notifications are no longer driven
+    // from the tmux pane text. They run on their own 30-minute interval
+    // (see startMonitoringPoll below) and trigger when the report file's
+    // mtime changes — independent of whatever appears on the screen.
+
     // Detect new permission request
     // SUPPRESSION: if the user just sent input into tmux, skip detection for a
     // few seconds. Their own text appears on screen briefly and could otherwise
@@ -257,6 +290,87 @@ async function startTmuxPolling(client) {
         text: "⚠️ Claude is requesting permission",
         blocks: buildPermissionBlocks(output),
       });
+    }
+  }
+}
+
+// ─── Periodic monitoring report poll ──────────────────────────────────────────
+// Independent of tmux polling. Every 30 minutes, checks the mtime of the
+// report file. If it's changed since the last check, reads the file and
+// posts its contents to the active /tmux-connect thread.
+//
+// Lifecycle: started once at bot boot (see the IIFE at the bottom of the
+// file). Runs forever, doesn't stop on /tmux-disconnect — it just goes
+// silent because there's no thread to post into.
+async function startMonitoringPoll(client) {
+  // On startup, record the file's CURRENT mtime as our baseline. This
+  // means: don't send the existing report on bot start; only send when
+  // the file is updated AFTER this moment.
+  try {
+    const stat = fs.statSync(MONITORING_REPORT_FILE);
+    lastReportMtimeMs = stat.mtimeMs;
+  } catch {
+    // File doesn't exist yet — that's fine, mtime stays at 0. As soon as
+    // the file appears, the first check below will fire (since any real
+    // mtime is > 0).
+    lastReportMtimeMs = 0;
+  }
+
+  while (true) {
+    // Sleep first, then check. This way the very first check happens
+    // 30 minutes after bot start, not at startup (we already set
+    // baseline above and don't want to send right away).
+    await new Promise(r => setTimeout(r, MONITORING_CHECK_INTERVAL_MS));
+
+    // Need an active /tmux-connect target. If none, just wait another 30 min.
+    if (!tmuxStreamChannel || !tmuxStreamTs) continue;
+
+    let stat;
+    try {
+      stat = fs.statSync(MONITORING_REPORT_FILE);
+    } catch {
+      // File missing — skip this cycle silently. (Don't spam errors.)
+      continue;
+    }
+
+    // File mtime unchanged → no new report → skip.
+    if (stat.mtimeMs === lastReportMtimeMs) continue;
+
+    // File has been updated since we last looked. Read and send.
+    lastReportMtimeMs = stat.mtimeMs;
+    const reportContent = readFileSafe(MONITORING_REPORT_FILE);
+
+    if (reportContent === null) {
+      // Race condition — file existed for stat but disappeared/became
+      // unreadable between stat and read. Notify and move on.
+      try {
+        await client.chat.postMessage({
+          channel: tmuxStreamChannel,
+          thread_ts: tmuxStreamTs,
+          text: `⚠️ *Monitoring report file could not be read:*\n\`${MONITORING_REPORT_FILE}\``,
+        });
+      } catch {}
+      continue;
+    }
+
+    // Slack messages are limited to ~3000 chars. Split into 2800-char
+    // chunks and send the first with a header, the rest as plain code blocks.
+    const chunks = chunkText(reportContent, 2800);
+    try {
+      await client.chat.postMessage({
+        channel: tmuxStreamChannel,
+        thread_ts: tmuxStreamTs,
+        text: `📊 *30분 정기 모니터링 리포트:*\n\`\`\`\n${chunks[0]}\n\`\`\``,
+      });
+      for (let i = 1; i < chunks.length; i++) {
+        await client.chat.postMessage({
+          channel: tmuxStreamChannel,
+          thread_ts: tmuxStreamTs,
+          text: `\`\`\`\n${chunks[i]}\n\`\`\``,
+        });
+      }
+    } catch (err) {
+      console.error("Monitoring report post failed:", err.message);
     }
   }
 }
@@ -822,6 +936,11 @@ app.action("exit_session", async ({ body, ack, client }) => {
 (async () => {
   await app.start();
   console.log("⚡ Claude ↔ Slack running! (read + write + shell + tmux enabled)");
+
+  // Start the periodic monitoring report watcher. Runs in the background
+  // forever; only emits messages when a /tmux-connect target is set AND
+  // the report file's mtime has changed since the last check.
+  startMonitoringPoll(app.client);
 
   // Auto-reconnect on unexpected crash
   process.on("uncaughtException", async (err) => {
