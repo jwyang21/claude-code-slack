@@ -115,8 +115,12 @@ const { execSync } = require("child_process");
 
 // ─── 2. LOAD .env INTO process.env ──────────────────────────────────────────
 // After this call, process.env.SLACK_BOT_TOKEN etc. are populated from the
+
 // .env file in the current working directory.
-dotenv.config();
+// dotenv.config();
+
+// whichever directory you run index.js, src/.env is always referenced
+require("dotenv").config({ path: require("path").join(__dirname, ".env") });
 
 // ─── 3. MODEL CONFIGURATION ─────────────────────────────────────────────────
 // Change this value to switch Claude models across the entire file. Both
