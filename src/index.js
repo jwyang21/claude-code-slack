@@ -5,7 +5,8 @@ const fs = require("fs");
 const path = require("path");
 const { execSync } = require("child_process");
 
-dotenv.config();
+// dotenv.config(); # looks for '.env' file in current working directory
+require("dotenv").config({ path: require("path").join(__dirname, ".env") }); // whichever directory you run index.js, src/.env is always referenced
 
 // ─── Model configuration ─────────────────────────────────────────────────────
 // Change this value to switch Claude models across the entire file.
