@@ -960,3 +960,50 @@ app.action("exit_session", async ({ body, ack, client }) => {
     }
   });
 })();
+
+// ─── (Optional) Daily Quote Poster ──────────────────────────────────────────────────────
+// The slack bot sends you a random positive quote 3 times a day regularly: (KST) 7AM, 1PM, 7PM. 
+// An yearly quote set exists, and it is newly shuffled at the beginning of each year.
+
+const cron = require('node-cron');
+
+const QUOTE_CHANNEL = 'C0B75H2HEQ6';                  // #quote 채널 ID
+const STATE_FILE = path.join(__dirname, 'quote-state.json');
+const POOL = require('./quotes.json');              // [{ q: "...", a: "저자" }, ...]  (≥1095개, 중복 없음)
+
+function shuffle(arr) {                              // Fisher–Yates
+  const a = [...arr];
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+
+function loadState() {
+  try { return JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')); }
+  catch { return { order: shuffle([...POOL.keys()]), cursor: 0 }; } // 최초 1회
+}
+
+function nextQuote() {
+  const s = loadState();
+  if (s.cursor >= s.order.length) {                 // 한 바퀴(≈1년) 끝 → 새 순서로 재셔플
+    s.order = shuffle([...POOL.keys()]);
+    s.cursor = 0;
+  }
+  const quote = POOL[s.order[s.cursor]];
+  s.cursor += 1;
+  fs.writeFileSync(STATE_FILE, JSON.stringify(s));  // 재시작 대비 즉시 저장
+  return quote;
+}
+
+async function sendQuote() {
+  const { q, a } = nextQuote();
+  await app.client.chat.postMessage({
+    channel: QUOTE_CHANNEL,
+    text: `🌅 *오늘의 명언*\n> ${q}\n> — ${a}`,
+  });
+}
+
+// KST 07:00 / 13:00 / 19:00 — cron 표현식 하나로 3슬롯 처리
+cron.schedule('0 7,13,19 * * *', sendQuote, { timezone: 'Asia/Seoul' });
