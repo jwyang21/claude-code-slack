@@ -1,0 +1,1294 @@
+// ═══════════════════════════════════════════════════════════════════════════
+//  Claude ↔ Slack Bridge — Annotated Reference Version
+// ═══════════════════════════════════════════════════════════════════════════
+//
+//  WHAT THIS FILE IS
+//  -----------------
+//  This is a fully-commented copy of src/index.js, intended as a reading
+//  reference for someone unfamiliar with the codebase (and/or with
+//  JavaScript). The actual JavaScript statements here are IDENTICAL,
+//  byte-for-byte, to src/index.js — only the comments differ. When the
+//  two files disagree, src/index.js is the source of truth.
+//
+//  WHAT THIS BOT DOES
+//  ------------------
+//  Four concurrent capabilities, all wired through a single Slack App
+//  running in Socket Mode:
+//
+//    1. /claude <task>       — Direct Anthropic API call. The bot reads
+//                              the user's request, optionally reads files
+//                              the user references, asks Claude what to
+//                              do, then executes WRITE / SHELL blocks
+//                              from the response (file edits, shell
+//                              commands, git operations).
+//
+//    2. /tmux-connect <id>   — Attaches to a tmux pane on the server.
+//                              The bot polls the pane every 3 seconds,
+//                              detects when claude-code is asking for
+//                              approval ("Do you want to proceed?", etc.),
+//                              and posts Yes/No buttons to Slack so the
+//                              user can approve from anywhere.
+//
+//    3. (background watcher) — Watches a "30-min monitoring report" file
+//                              and posts its contents to Slack whenever
+//                              it changes (drives the user's habit of
+//                              having claude-code summarize work every
+//                              30 min). Runs independently of /tmux-*.
+//
+//    4. (daily quote cron)   — A node-cron job fires 3x/day (07:00, 13:00,
+//                              19:00 KST) and posts one inspirational quote
+//                              to a dedicated #quote channel. Quotes are
+//                              drawn from a pre-shuffled pool (quotes.json)
+//                              so none repeats until the whole pool is
+//                              exhausted; progress survives restarts via a
+//                              small state file. Independent of /tmux-* and
+//                              of the monitoring watcher.
+//
+//  RELIABILITY IMPROVEMENTS over the original draft
+//  ------------------------------------------------
+//    1. STRONG / WEAK pattern split — permission regexes are partitioned
+//       into two categories. STRONG patterns trigger detection on their
+//       own; WEAK patterns are documentation-only (currently ignored by
+//       the detector) because they also appear during normal "Thinking…".
+//
+//    2. Three overly broad patterns REMOVED outright — they fired on
+//       everyday conversation, GitHub PR text, etc.:
+//         /confirm.*\?/i, /Approve\?/i, /Allow Claude to/i
+//
+//    3. Yes/No number-list pattern TIGHTENED to "1." and "2." on
+//       CONSECUTIVE lines, not "anywhere in the buffer". Prevents matches
+//       on Claude's prose answers that contain Pros/Cons style lists.
+//
+//    4. Input echo suppression — after tmuxSend() pushes user text into
+//       the pane, permission detection is paused for ~4 seconds. Prevents
+//       echoed user input (e.g. a pasted snippet containing "[Y/n]") from
+//       firing a false alarm.
+//
+//    5. ANSI strip regex extended to include '?' in the character class —
+//       catches CSI sequences like "\x1b[?25l" (hide cursor) and
+//       "\x1b[?1049h" (alt screen) that the old regex missed.
+//
+//    6. Multi-line input handling — when the user sends a multi-line
+//       message, claude-code shows it as "[Pasted text #1 +N lines]".
+//       A single Enter only closes that placeholder. tmuxSend() now
+//       detects newlines and sends TWO Enters with a delay between.
+//
+//    7. One-shot reminder — instead of nagging the user every 5 minutes,
+//       send the "still waiting" reminder exactly ONCE per prompt.
+//       Recurring reminders became noise when false alarms fired on
+//       static pseudo-prompts that never disappear.
+//
+//    8. Periodic monitoring report (mtime-based file watcher) — separate
+//       background loop checks /home/jwyang/30-min-report.txt every
+//       30 min; if mtime changed, posts the file contents. mtime is
+//       robust against the on-screen text changing due to formatting
+//       prefixes (e.g. claude-code's "●") or partial renders.
+//
+//  ONE-MINUTE JAVASCRIPT REFRESHER
+//  --------------------------------
+//  If you don't know JavaScript, here's the minimum you need:
+//
+//    const x = 5;                    `const` = value that never changes.
+//    let   y = 10;                   `let`   = value that CAN change later.
+//    function foo(a, b) { ... }      function with positional parameters.
+//    (arg) => { ... }                arrow function = compact syntax.
+//    async function / await          async = the function may do slow work;
+//                                    await = "pause here until this finishes".
+//    const { a, b } = obj;           destructuring: pull fields out of an
+//                                    object into local variables.
+//    `hello ${name}`                 template literal with substitution.
+//    /pattern/flags                  regular expression for text matching.
+//    arr.map(fn) / arr.filter(fn)    transform / keep-some-of an array.
+//
+// ═══════════════════════════════════════════════════════════════════════════
+
+
+// ─── 1. REQUIRES (import third-party and built-in modules) ──────────────────
+//   @slack/bolt        — official Slack SDK; gives us the `App` class which
+//                        handles WebSocket connection, slash commands,
+//                        event subscriptions, and message posting.
+//   @anthropic-ai/sdk  — official Anthropic SDK; gives us a client for
+//                        the /v1/messages API (Claude completions).
+//   dotenv             — loads .env file into process.env so we can read
+//                        SLACK_BOT_TOKEN etc. without hardcoding them.
+//   fs / path          — Node.js built-ins for filesystem and path ops.
+//   child_process      — for execSync(): run shell commands synchronously
+//                        and get their output as a string.
+const { App } = require("@slack/bolt");
+const Anthropic = require("@anthropic-ai/sdk");
+const dotenv = require("dotenv");
+const fs = require("fs");
+const path = require("path");
+const { execSync } = require("child_process");
+
+
+// ─── 2. LOAD .env INTO process.env ──────────────────────────────────────────
+// After this call, process.env.SLACK_BOT_TOKEN etc. are populated from the
+
+// .env file in the current working directory.
+// dotenv.config();
+
+// whichever directory you run index.js, src/.env is always referenced
+require("dotenv").config({ path: require("path").join(__dirname, ".env") });
+
+// ─── 3. MODEL CONFIGURATION ─────────────────────────────────────────────────
+// Change this value to switch Claude models across the entire file. Both
+// the /claude command (24000-token agent calls) and the "? <question>"
+// thread shortcut (3000-token short answers) read from this same constant.
+const MODEL = "claude-opus-4-7";
+
+// ─── 4. CLIENT INSTANCES + SESSION STORE ────────────────────────────────────
+//   anthropic — the Anthropic SDK client. .messages.stream(...) is how we
+//               talk to Claude. The .default is because the SDK exports
+//               are wrapped in a default export under CommonJS.
+//   app       — the Slack Bolt app. socketMode: true means we open a
+//               persistent WebSocket to Slack instead of receiving HTTP
+//               webhooks. That avoids needing a public URL for the bot.
+//   sessions  — in-memory Map keyed by "<channel>:<thread_ts>". Holds
+//               per-thread conversation history so follow-up messages
+//               continue the same context.
+const anthropic = new Anthropic.default({ apiKey: process.env.ANTHROPIC_API_KEY });
+const app = new App({ token: process.env.SLACK_BOT_TOKEN, appToken: process.env.SLACK_APP_TOKEN, socketMode: true });
+const sessions = new Map();
+
+// ─── 5. TMUX STATE (module-level variables that the bot mutates) ────────────
+//
+// All of these are GLOBAL to the bot process. They survive between Slack
+// events and slash commands. Reset to null when /tmux-disconnect runs or
+// when /tmux-connect attaches to a new target.
+//
+//   currentTmuxSession  — the session ID string the bot is currently
+//                         attached to (e.g. "5", "0:0.1"). null = not
+//                         attached, ignore tmux events.
+//   tmuxPollingActive   — boolean flag controlling the polling loop.
+//                         Set false to ask the loop to exit gracefully.
+//   tmuxStreamChannel   — Slack channel ID where /tmux-connect was run.
+//                         All tmux-related messages post here.
+//   tmuxStreamTs        — Slack timestamp (= message ID) of the anchor
+//                         message created on /tmux-connect. Used as
+//                         thread_ts so subsequent messages thread under it.
+//   tmuxLiveMsgTs       — legacy / mostly unused.
+//   lastTmuxOutput      — tmux screen content from the previous poll.
+//                         Used to skip iterations where nothing changed.
+//   awaitingPermission  — true while a permission prompt is waiting for
+//                         the user to respond. Prevents duplicate alerts.
+let currentTmuxSession = null;
+let tmuxPollingActive = false;
+let tmuxStreamChannel = null;
+let tmuxStreamTs = null;
+let tmuxLiveMsgTs = null;
+let lastTmuxOutput = "";
+let awaitingPermission = false;
+// Fingerprint (마지막 300자) of the prompt that triggered the most recent
+// permission alert. Used to suppress duplicate alerts for the same on-screen
+// prompt. Cleared implicitly by being overwritten on each new alert; an
+// auto-reset path also nulls this when the prompt disappears entirely.
+// Prevents false-alarm storms when the user's own input briefly redraws
+// the screen and the same prompt re-appears underneath.
+let lastPromptFingerprint = null;
+
+// ─── 5b. INPUT-ECHO SUPPRESSION STATE ───────────────────────────────────────
+// When the user sends text into tmux (via /tmux command, thread reply, or
+// Slack button click), that text appears on the tmux pane. If the polling
+// loop captures the pane a moment later, it sees the user's own text on
+// screen and could mistakenly treat it as a permission request.
+// Fix: every tmuxSend() updates lastUserInputAt to the current time. The
+// polling loop checks this and skips permission detection if the input
+// happened within the last INPUT_ECHO_SUPPRESS_MS window.
+//
+// 4000 ms chosen empirically — long enough for the typed text to finish
+// appearing on screen and for claude-code's TUI to redraw, short enough
+// that real permission requests won't be suppressed for long.
+let lastUserInputAt = 0;
+const INPUT_ECHO_SUPPRESS_MS = 4000;
+
+// ─── 5c. PERIODIC MONITORING REPORT STATE ───────────────────────────────────
+// User has a claude-code rule that writes a 30-minute work summary to the
+// report file below. When that file gets updated (mtime changes), we post
+// its contents to the active Slack tmux thread as a notification.
+//
+// Why mtime-based instead of text-trigger based: matching specific text on
+// the tmux pane was fragile — claude-code prepends formatting characters
+// ("●", color codes, etc.) and renders gradually, so the exact text could
+// be missed or duplicated. The report file is the canonical source: when
+// it changes, exactly one update has happened, so exactly one Slack
+// notification fires.
+//
+// Behavior:
+//   - On bot start, we record the file's current mtime (or 0 if missing)
+//     and do NOT send. This avoids re-sending the same old report every
+//     time the bot restarts.
+//   - Then every 30 minutes (MONITORING_CHECK_INTERVAL_MS) we check the
+//     file's mtime. If it has changed since we last saw it, we send the
+//     file contents and update our remembered mtime.
+//   - Notifications only go out if /tmux-connect is active (we need a
+//     channel + thread to post into).
+const MONITORING_REPORT_FILE = "/home/jwyang/30-min-report.txt";
+const MONITORING_CHECK_INTERVAL_MS = 30 * 60 * 1000;   // 30 minutes
+// Last-seen mtime of the report file (ms since epoch). Initialized to 0
+// and set on the first poll (see startMonitoringPoll below). Updated each
+// time we send a new notification.
+let lastReportMtimeMs = 0;
+
+// ─── Permission prompt detection ──────────────────────────────────────────────
+//
+// PATTERN CATEGORIES
+// ------------------
+// STRONG: each pattern is specific enough to trigger detection on its own.
+//         "Do you want to proceed?" basically only appears inside claude-code's
+//         approval dialog (and some CLI tools), so its standalone presence is
+//         a reliable signal.
+// WEAK:   each pattern is too generic to trigger on its own — e.g. "Esc to
+//         cancel" also shows up in claude-code's "Thinking…" footer while the
+//         model is still working (= no permission being asked). So we only
+//         count a WEAK match if at least one STRONG pattern ALSO matches.
+//
+// REMOVED (from the prior version) because they were too lax:
+//   /confirm.*\?/i       — fires on any sentence containing "confirm" + "?"
+//   /Approve\?/i         — fires on GitHub/GitLab review strings, emails
+//   /Allow Claude to/i   — fires when Claude itself discusses its own perms
+//
+// TIGHTENED:
+//   The old /1\.\s*Yes.*2\.\s*No/is used DOTALL ('s' flag), so "1. Yes" and
+//   "2. No" could be thousands of characters apart (common in Claude's
+//   prose explanations). The new version requires them on CONSECUTIVE
+//   non-empty lines, which matches the real UI but not prose lists.
+const STRONG_PATTERNS = [
+  /Do you want to proceed\?/i,
+  /This command requires approval/i,
+  /Allow this action\?/i,
+  /\(y\/n\)/i,
+  /\[y\/N\]/i,
+  /\[Y\/n\]/i,
+  /1\.\s*Yes[^\n]*\n\s*2\.\s*No/i,   // consecutive-line Yes/No list
+  /Yes.*No.*\(enter number\)/is,
+  /[❯›]\s?1\.\s+(Yes|No|Allow|Deny|Confirm|Cancel)/i,   // cursor + "1." + permission-related keyword (Yes/No/Allow/etc.) — narrowed from the looser "\w" version that fired on any letter after "1." and caused false alarms when the user's own multi-question input was redrawn by claude-code with a "❯" near a "(1)" reference
+];
+
+// WEAK patterns: claude-code TUI chrome that often appears WITHOUT a real
+// permission request (e.g. during "Thinking…"). Only counted if a STRONG
+// pattern is also present.
+const WEAK_PATTERNS = [
+  /Esc to cancel/i,
+  /Tab to amend/i,
+];
+
+function detectPermissionRequest(output) {
+  const strongHit = STRONG_PATTERNS.some(p => p.test(output));
+  if (strongHit) return true;
+  // WEAK-only match is ignored — it's almost always TUI chrome.
+  return false;
+}
+
+// ─── Parse numbered options from claude-code output ───────────────────────────
+function parseOptions(output) {
+  // Only look at the section AFTER "Do you want to proceed?"
+  const promptIndex = output.search(/Do you want to proceed\?/i);
+  const relevant = promptIndex !== -1 ? output.slice(promptIndex) : output;
+
+  const matches = [...relevant.matchAll(/^[\s❯›]*([1-9])\.\s+(.+)/gm)];
+  if (matches.length >= 2) {
+    const seen = new Set();
+    const unique = [];
+    for (const m of matches) {
+      if (!seen.has(m[1])) {
+        seen.add(m[1]);
+        unique.push({ number: m[1], label: m[2].trim() });
+      }
+    }
+    if (unique.length >= 2) return { options: unique, parsed: true };
+  }
+  return {
+    options: [
+      { number: "1", label: "Yes" },
+      { number: "2", label: "No" },
+    ],
+    parsed: false,  // fallback — actual options could not be parsed
+  };
+}
+
+function buildPermissionBlocks(output) {
+  const { options, parsed } = parseOptions(output);
+  const ts = Date.now(); // unique suffix to avoid duplicate action_id errors
+  const buttons = options.map(opt => {
+    const label = `${opt.number}. ${opt.label}`;
+    const truncated = label.length > 75 ? label.slice(0, 72) + "…" : label;
+    return {
+      type: "button",
+      text: { type: "plain_text", text: truncated, emoji: true },
+      style: opt.label.toLowerCase().startsWith("no") ? "danger" : "primary",
+      action_id: `tmux_option_${opt.number}_${ts}`,  // ← unique per message
+      value: opt.number,
+    };
+  });
+  const headerText = parsed
+    ? `⚠️ *Claude is requesting permission:*`
+    : `⚠️ *Claude is requesting permission:*\n_⚠️ Could not parse options — showing default Yes/No. *Check terminal directly if more options exist.*_`;
+  return [
+    {
+      type: "section",
+      text: {
+        type: "mrkdwn",
+        text: `${headerText}\n\`\`\`\n${output.slice(-600)}\n\`\`\``,
+      },
+    },
+    { type: "actions", elements: buttons },
+  ];
+}
+
+// ─── 9. BACKGROUND POLLING LOOP (tmux pane watcher) ─────────────────────────
+//
+// Started by /tmux-connect, stopped by /tmux-disconnect or by attaching to
+// a different session. Runs forever inside an async loop until
+// tmuxPollingActive flips to false.
+//
+// EACH ITERATION (every 3 seconds):
+//   1. Sleep 3 seconds.
+//   2. Capture the tmux pane content via `tmux capture-pane`.
+//   3. Strip ANSI escape codes (color, cursor, etc.) for clean matching.
+//   4. (Skipped here, but used to be) trigger "30분 정기 모니터링" detection
+//      from the text — that has moved to startMonitoringPoll below.
+//   5. Check for echo suppression: did the user just send input?
+//   6. If still waiting for a permission response, check if 5 minutes
+//      have elapsed → send a one-shot reminder.
+//   7. If the output hasn't changed since last poll → skip the rest.
+//   8. Detect a new permission request: if patterns match and we're not
+//      already awaiting, post the alert with buttons.
+//
+// EXITS: the while(tmuxPollingActive) loop exits when either:
+//   - /tmux-disconnect sets the flag to false, or
+//   - /tmux-connect attaches to a new session (which first stops this one)
+//   - tmuxCapture() throws (e.g. session was killed externally)
+async function startTmuxPolling(client) {
+  if (tmuxPollingActive) return;
+  tmuxPollingActive = true;
+  lastTmuxOutput = "";
+  awaitingPermission = false;
+  let awaitingPermissionSince = null;
+  let reminderSent = false;       // True once we've sent the one-shot reminder
+                                  // for the current prompt. Reset to false when
+                                  // the prompt disappears or is replaced.
+  let claudeWasWorking = false;
+  let responseStartOutput = "";
+
+  while (tmuxPollingActive) {
+    await new Promise(r => setTimeout(r, 3000));
+    if (!tmuxPollingActive) break;
+
+    let raw;
+    try {
+      raw = tmuxCapture();
+    } catch { break; }
+
+    const stripped = raw.replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, "").replace(/\x1b\][^\x07]*\x07/g, "");
+    const output = stripped.trim().slice(-8000);
+
+    // Auto-reset if permission prompt disappeared
+    if (awaitingPermission && !detectPermissionRequest(output)) {
+      awaitingPermission = false;
+      awaitingPermissionSince = null;
+      reminderSent = false;     // Reset for next prompt
+    }
+
+    // Send reminder ONCE after 5 minutes if still awaiting response.
+    // We deliberately do NOT keep sending repeated reminders, because
+    // some claude-code outputs contain numbered lists ("1. ..., 2. ...")
+    // that match our permission patterns even though no real permission
+    // is being requested. In that case the on-screen text never changes
+    // and the user can't dismiss it from Slack — repeated reminders just
+    // become noise. One reminder is enough to alert the user; if it's a
+    // false alarm they can ignore it; if it's real they can respond.
+    if (awaitingPermission && awaitingPermissionSince && !reminderSent) {
+      if (Date.now() - awaitingPermissionSince > 300000) {
+        await client.chat.postMessage({
+          channel: tmuxStreamChannel,
+          thread_ts: tmuxStreamTs,
+          text: "⏰ *Reminder — Claude is still waiting for your response:*",
+          blocks: buildPermissionBlocks(lastTmuxOutput),
+        });
+        reminderSent = true;    // Mark as sent — no more reminders for this prompt
+      }
+    }
+
+    if (output === lastTmuxOutput) continue;
+    lastTmuxOutput = output;
+
+    // Track if claude-code is working
+    // const isWorking = /Thinking…|Crafting…|Tempering…|Waddling…|Running…|Working…|Twisting…|thinking\)|⠋|⠙|⠹|⠸|⠼|⠴|⠦|⠧|⠇|⠏/.test(output);
+    // const isIdle = /^[❯>]\s*/m.test(output) && !isWorking;
+
+    // if (isWorking && !claudeWasWorking) {
+    //   claudeWasWorking = true;
+    //   responseStartOutput = output;
+    // }
+
+    // // Claude finished responding → send full response
+    // if (claudeWasWorking && isIdle && !awaitingPermission) {
+    //   claudeWasWorking = false;
+
+    //   const newContent = output.slice(-3000);
+    //   const chunks = chunkText(newContent, 2800);
+
+    //   await client.chat.postMessage({
+    //     channel: tmuxStreamChannel,
+    //     thread_ts: tmuxStreamTs,
+    //     text: `💬 *Claude responded:*`,
+    //   });
+
+    //   for (const chunk of chunks) {
+    //     await client.chat.postMessage({
+    //       channel: tmuxStreamChannel,
+    //       thread_ts: tmuxStreamTs,
+    //       text: `\`\`\`\n${chunk}\n\`\`\``,
+    //     });
+    //   }
+
+    //   responseStartOutput = "";
+    // }
+
+    // Note: periodic monitoring report notifications are no longer driven
+    // from the tmux pane text. They run on their own 30-minute interval
+    // (see startMonitoringPoll below) and trigger when the report file's
+    // mtime changes — independent of whatever appears on the screen.
+
+    // Detect new permission request
+    // SUPPRESSION: if the user just sent input into tmux, skip detection for a
+    // few seconds. Their own text appears on screen briefly and could otherwise
+    // be mistaken for a prompt (e.g. they paste a snippet containing "[Y/n]").
+    const sinceUserInput = Date.now() - lastUserInputAt;
+    const echoSuppress = sinceUserInput < INPUT_ECHO_SUPPRESS_MS;
+
+    if (!awaitingPermission && !echoSuppress && detectPermissionRequest(output)) {
+      // ── DUPLICATE-PROMPT GUARD (fingerprint check) ──
+      // Even after the pattern matches, we may have already alerted the
+      // user for THIS SAME on-screen prompt. That happens when:
+      //   - The user resolved the previous permission in the terminal
+      //     directly (so the pane text didn't visibly change), then sent
+      //     new input that briefly redrew the screen; the original prompt
+      //     reappears underneath and gets re-matched.
+      //   - claude-code redraws the prompt as part of normal TUI behavior.
+      // Take a fingerprint of the last 300 chars and skip if unchanged.
+      const fingerprint = output.slice(-300);
+      if (fingerprint === lastPromptFingerprint) continue;
+      lastPromptFingerprint = fingerprint;
+
+      awaitingPermission = true;
+      awaitingPermissionSince = Date.now();
+      reminderSent = false;     // Fresh prompt → enable reminder again
+
+      if (tmuxLiveMsgTs) {
+        try {
+          await client.chat.update({
+            channel: tmuxStreamChannel,
+            ts: tmuxLiveMsgTs,
+            text: `\`\`\`\n${output.slice(-2800)}\n\`\`\``,
+          });
+        } catch {}
+      }
+
+      await client.chat.postMessage({
+        channel: tmuxStreamChannel,
+        thread_ts: tmuxStreamTs,
+        text: "⚠️ Claude is requesting permission",
+        blocks: buildPermissionBlocks(output),
+      });
+    }
+  }
+}
+
+// ─── Periodic monitoring report poll ──────────────────────────────────────────
+// Independent of tmux polling. Every 30 minutes, checks the mtime of the
+// report file. If it's changed since the last check, reads the file and
+// posts its contents to the active /tmux-connect thread.
+//
+// Lifecycle: started once at bot boot (see the IIFE at the bottom of the
+// file). Runs forever, doesn't stop on /tmux-disconnect — it just goes
+// silent because there's no thread to post into.
+async function startMonitoringPoll(client) {
+  // On startup, record the file's CURRENT mtime as our baseline. This
+  // means: don't send the existing report on bot start; only send when
+  // the file is updated AFTER this moment.
+  try {
+    const stat = fs.statSync(MONITORING_REPORT_FILE);
+    lastReportMtimeMs = stat.mtimeMs;
+  } catch {
+    // File doesn't exist yet — that's fine, mtime stays at 0. As soon as
+    // the file appears, the first check below will fire (since any real
+    // mtime is > 0).
+    lastReportMtimeMs = 0;
+  }
+
+  while (true) {
+    // Sleep first, then check. This way the very first check happens
+    // 30 minutes after bot start, not at startup (we already set
+    // baseline above and don't want to send right away).
+    await new Promise(r => setTimeout(r, MONITORING_CHECK_INTERVAL_MS));
+
+    // Need an active /tmux-connect target. If none, just wait another 30 min.
+    if (!tmuxStreamChannel || !tmuxStreamTs) continue;
+
+    let stat;
+    try {
+      stat = fs.statSync(MONITORING_REPORT_FILE);
+    } catch {
+      // File missing — skip this cycle silently. (Don't spam errors.)
+      continue;
+    }
+
+    // File mtime unchanged → no new report → skip.
+    if (stat.mtimeMs === lastReportMtimeMs) continue;
+
+    // File has been updated since we last looked. Read and send.
+    lastReportMtimeMs = stat.mtimeMs;
+    const reportContent = readFileSafe(MONITORING_REPORT_FILE);
+
+    if (reportContent === null) {
+      // Race condition — file existed for stat but disappeared/became
+      // unreadable between stat and read. Notify and move on.
+      try {
+        await client.chat.postMessage({
+          channel: tmuxStreamChannel,
+          thread_ts: tmuxStreamTs,
+          text: `⚠️ *Monitoring report file could not be read:*\n\`${MONITORING_REPORT_FILE}\``,
+        });
+      } catch {}
+      continue;
+    }
+
+    // Slack messages are limited to ~3000 chars. Split into 2800-char
+    // chunks and send the first with a header, the rest as plain code blocks.
+    const chunks = chunkText(reportContent, 2800);
+    try {
+      await client.chat.postMessage({
+        channel: tmuxStreamChannel,
+        thread_ts: tmuxStreamTs,
+        text: `📊 *30분 정기 모니터링 리포트:*\n\`\`\`\n${chunks[0]}\n\`\`\``,
+      });
+      for (let i = 1; i < chunks.length; i++) {
+        await client.chat.postMessage({
+          channel: tmuxStreamChannel,
+          thread_ts: tmuxStreamTs,
+          text: `\`\`\`\n${chunks[i]}\n\`\`\``,
+        });
+      }
+    } catch (err) {
+      console.error("Monitoring report post failed:", err.message);
+    }
+  }
+}
+
+// ─── 10. BUTTON CLICK HANDLER (for the dynamic permission-option buttons) ───
+//
+// Fires when a user clicks a button in Slack that has an action_id like
+// "tmux_option_1_1712345678901". The regex captures the option number
+// (the first \d+). The trailing _\d+ is a per-message timestamp used to
+// keep action_ids unique across messages (Slack rejects duplicate IDs).
+//
+// To "press option N" in Claude Code's TUI, we send (N-1) DOWN arrow keys
+// to move the selection cursor, then ENTER to confirm.
+//
+// IMPORTANT: this is fundamentally different from how Y/N text prompts
+// work. For e.g. "Continue? [y/N]", pressing Enter alone confirms the
+// default (N) — clicking "1. Yes" via this handler sends 0 DOWNs + Enter,
+// which actually sends "No". For pattern-matched-as-fallback Y/N prompts
+// the user must respond in the terminal directly.
+app.action(/^tmux_option_(\d+)_\d+$/, async ({ body, ack, client, action }) => {
+  await ack();
+  if (!currentTmuxSession) return;
+
+  const number = parseInt(action.value);
+  for (let i = 0; i < number - 1; i++) {
+    execSync(`tmux send-keys -t ${getTmuxTarget(currentTmuxSession)} Down`);
+    await new Promise(r => setTimeout(r, 150));
+  }
+  execSync(`tmux send-keys -t ${getTmuxTarget(currentTmuxSession)} Enter`);
+
+  awaitingPermission = false;  // immediately stop reminders
+
+  // Replace buttons with confirmation message
+  try {
+    await client.chat.update({
+      channel: body.channel.id,
+      ts: body.message.ts,
+      text: `✅ *Responded: option ${number}*`,
+      blocks: [],
+    });
+  } catch {}
+});
+
+// ─── /tmux-connect ────────────────────────────────────────────────────────────
+app.command("/tmux-connect", async ({ command, ack, client }) => {
+  await ack();
+  const sessionId = command.text.trim();
+  if (!sessionId) {
+    await client.chat.postEphemeral({
+      channel: command.channel_id,
+      user: command.user_id,
+      text: "Usage: `/tmux-connect <session-index>`\nExample: `/tmux-connect 2`",
+    });
+    return;
+  }
+
+  // Verify session exists
+  try {
+    execSync(`tmux has-session -t ${sessionId}`);
+  } catch {
+    await client.chat.postEphemeral({
+      channel: command.channel_id,
+      user: command.user_id,
+      text: `❌ tmux session \`${sessionId}\` not found. Run \`tmux ls\` to check.`,
+    });
+    return;
+  }
+
+  // Stop previous polling if any
+  tmuxPollingActive = false;
+  await new Promise(r => setTimeout(r, 500));
+
+  currentTmuxSession = sessionId;
+  tmuxStreamChannel = command.channel_id;
+  awaitingPermission = false;
+
+  // Create thread anchor message
+  const anchorMsg = await client.chat.postMessage({
+    channel: command.channel_id,
+    text: `🔗 *Connected to tmux session \`${sessionId}\`* — monitoring for permission requests.\nUse \`/tmux-status\` to see current output anytime.`,
+  });
+  tmuxStreamTs = anchorMsg.ts;
+
+  // Post current state once on connect
+  try {
+    const raw = tmuxCapture();
+    const stripped = raw.replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, "").replace(/\x1b\][^\x07]*\x07/g, "");
+    const output = stripped.trim().slice(-2800);
+    await client.chat.postMessage({
+      channel: command.channel_id,
+      thread_ts: tmuxStreamTs,
+      text: `📺 *Current output:*\n\`\`\`\n${output}\n\`\`\``,
+    });
+    lastTmuxOutput = output;
+  } catch {}
+
+  // Start background polling (permission requests only)
+  startTmuxPolling(client);
+});
+
+app.command("/tmux-status", async ({ command, ack, client }) => {
+  await ack();
+  if (!currentTmuxSession) {
+    await client.chat.postEphemeral({
+      channel: command.channel_id,
+      user: command.user_id,
+      text: "Not connected to any tmux session. Use `/tmux-connect <session-index>` first.",
+    });
+    return;
+  }
+  try {
+    const raw = tmuxCapture();
+    const stripped = raw.replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, "").replace(/\x1b\][^\x07]*\x07/g, "");
+    const output = stripped.trim().slice(-2800);
+    await client.chat.postMessage({
+      channel: command.channel_id,
+      thread_ts: tmuxStreamTs,
+      text: `📺 *Current output:*\n\`\`\`\n${output}\n\`\`\``,
+    });
+  } catch (err) {
+    await client.chat.postEphemeral({
+      channel: command.channel_id,
+      user: command.user_id,
+      text: `❌ Error: ${err.message}`,
+    });
+  }
+});
+
+// ─── /tmux-disconnect ─────────────────────────────────────────────────────────
+app.command("/tmux-disconnect", async ({ command, ack, client }) => {
+  await ack();
+  tmuxPollingActive = false;
+  currentTmuxSession = null;
+  await client.chat.postMessage({
+    channel: command.channel_id,
+    text: "🔌 *Disconnected from tmux session.*",
+  });
+});
+
+// ─── /tmux — send input to connected session ──────────────────────────────────
+app.command("/tmux", async ({ command, ack, client }) => {
+  await ack();
+  if (!currentTmuxSession) {
+    await client.chat.postEphemeral({
+      channel: command.channel_id,
+      user: command.user_id,
+      text: "Connect first with `/tmux-connect <session-index>`.",
+    });
+    return;
+  }
+
+  const input = command.text.trim();
+  if (!input) return;
+
+  awaitingPermission = false;
+  tmuxSend(input);
+
+  await client.chat.postMessage({
+    channel: command.channel_id,
+    thread_ts: tmuxStreamTs,
+    text: `⌨️ *Sent:* \`${input}\``,
+  });
+});
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+function sessionKey(channelId, threadTs) { return threadTs ? `${channelId}:${threadTs}` : channelId; }
+
+async function postStatus(client, channel, threadTs, text) {
+  return client.chat.postMessage({ channel, thread_ts: threadTs, text, mrkdwn: true });
+}
+
+function chunkText(text, maxLen) {
+  const chunks = [];
+  while (text.length > maxLen) { chunks.push(text.slice(0, maxLen)); text = text.slice(maxLen); }
+  chunks.push(text);
+  return chunks;
+}
+
+async function postWithActions(client, channel, threadTs, text) {
+  const chunks = chunkText(text, 2800);
+  for (let i = 0; i < chunks.length - 1; i++) await postStatus(client, channel, threadTs, chunks[i]);
+  return client.chat.postMessage({
+    channel, thread_ts: threadTs, mrkdwn: true, text: "Completed!",
+    blocks: [
+      { type: "section", text: { type: "mrkdwn", text: `✅ *Completed!*\n\n${chunks[chunks.length - 1]}` } },
+      { type: "actions", elements: [
+        { type: "button", text: { type: "plain_text", text: "🚀 New Task", emoji: true }, style: "primary", action_id: "new_task", value: JSON.stringify({ channel, threadTs }) },
+        { type: "button", text: { type: "plain_text", text: "🛑 Exit Session", emoji: true }, style: "danger", action_id: "exit_session", value: JSON.stringify({ channel, threadTs }) },
+      ]},
+    ],
+  });
+}
+
+// ─── File Reading ─────────────────────────────────────────────────────────────
+const CODE_EXTS = new Set([".py",".js",".ts",".jsx",".tsx",".java",".cpp",".c",".h",".go",".rs",".rb",".sh",".yaml",".yml",".json",".toml",".md",".txt",".html",".css",".sql"]);
+
+function readFileSafe(filePath) {
+  try {
+    const stat = fs.statSync(filePath);
+    if (stat.size > 100 * 1024) return `[File is too large (exceeds 100KB): ${filePath}]`;
+    return fs.readFileSync(filePath, "utf-8");
+  } catch { return null; }
+}
+
+function collectFiles(dirPath, maxFiles = 30) {
+  const results = [];
+  function walk(current) {
+    if (results.length >= maxFiles) return;
+    let entries;
+    try { entries = fs.readdirSync(current, { withFileTypes: true }); } catch { return; }
+    for (const entry of entries) {
+      if (results.length >= maxFiles) break;
+      if (entry.name.startsWith(".") || ["node_modules","__pycache__",".git","dist","build"].includes(entry.name)) continue;
+      const fullPath = path.join(current, entry.name);
+      if (entry.isDirectory()) walk(fullPath);
+      else if (CODE_EXTS.has(path.extname(entry.name).toLowerCase())) {
+        const content = readFileSafe(fullPath);
+        if (content !== null) results.push({ path: fullPath, content });
+      }
+    }
+  }
+  walk(dirPath);
+  return results;
+}
+
+function extractPaths(text) {
+  const matches = text.match(/\/[^\s`'"，,]+/g) || [];
+  return matches.filter(p => { try { fs.accessSync(p); return true; } catch { return false; } });
+}
+
+function buildFileContext(paths) {
+  if (paths.length === 0) return "";
+  let ctx = "\n\n---\nContent of required file/directory contents:\n\n";
+  for (const p of paths) {
+    let stat;
+    try { stat = fs.statSync(p); } catch { ctx += `[Absent path: ${p}]\n`; continue; }
+    if (stat.isDirectory()) {
+      const files = collectFiles(p);
+      if (files.length === 0) { ctx += `[Empty directory: ${p}]\n`; continue; }
+      ctx += `### 📁 ${p} (${files.length} files)\n\n`;
+      for (const f of files) {
+        const ext = path.extname(f.path).slice(1) || "txt";
+        ctx += `**${f.path}**\n\`\`\`${ext}\n${f.content}\n\`\`\`\n\n`;
+      }
+    } else {
+      const content = readFileSafe(p);
+      if (content === null) { ctx += `[Failed reading file: ${p}]\n`; continue; }
+      const ext = path.extname(p).slice(1) || "txt";
+      ctx += `**${p}**\n\`\`\`${ext}\n${content}\n\`\`\`\n\n`;
+    }
+  }
+  return ctx;
+}
+
+// ─── File Writing ─────────────────────────────────────────────────────────────
+function parseAndApplyWrites(responseText) {
+  const writeRegex = /<<<WRITE:([^>]+)>>>\n([\s\S]*?)<<<END>>>/g;
+  const written = [];
+  let match;
+  while ((match = writeRegex.exec(responseText)) !== null) {
+    const filePath = match[1].trim();
+    const content = match[2];
+    try {
+      fs.mkdirSync(path.dirname(filePath), { recursive: true });
+      fs.writeFileSync(filePath, content, "utf-8");
+      written.push(filePath);
+    } catch (e) {
+      written.push(`[Failed writing: ${filePath} — ${e.message}]`);
+    }
+  }
+  const cleaned = responseText.replace(/<<<WRITE:[^>]+>>>\n[\s\S]*?<<<END>>>/g, "").trim();
+  return { cleaned, written };
+}
+
+// ─── Shell Execution ──────────────────────────────────────────────────────────
+function parseAndRunShell(responseText) {
+  const shellRegex = /<<<SHELL(?::([^>]+))?>>>\n([\s\S]*?)<<<END>>>/g;
+  const results = [];
+  let match;
+  while ((match = shellRegex.exec(responseText)) !== null) {
+    const cwd = match[1] ? match[1].trim() : process.cwd();
+    const commands = match[2].trim();
+    const tmpFile = `/tmp/claude_shell_${Date.now()}.sh`;
+    try {
+      fs.writeFileSync(tmpFile, commands, "utf-8");
+      const output = execSync(`bash ${tmpFile}`, { cwd, encoding: "utf-8", timeout: 30000 });
+      results.push({ commands, output: output.trim() || "(no output)", success: true });
+    } catch (e) {
+      results.push({ commands, output: (e.stderr || e.message).trim(), success: false });
+    } finally {
+      try { fs.unlinkSync(tmpFile); } catch {}
+    }
+  }
+  const cleaned = responseText.replace(/<<<SHELL(?::[^>]+)?>>>\n[\s\S]*?<<<END>>>/g, "").trim();
+  return { cleaned, results };
+}
+
+// ─── System Prompt ────────────────────────────────────────────────────────────
+const SYSTEM_PROMPT = `You are an AI coding assistant with direct file system and shell access.
+
+CRITICAL: You MUST use these exact block formats. Never say "I cannot run commands" — you CAN.
+
+To write/create files:
+<<<WRITE:/absolute/path/to/file>>>
+file content here
+<<<END>>>
+
+To run shell commands:
+<<<SHELL:/working/directory>>>
+command here
+<<<END>>>
+
+MANDATORY RULES:
+- ALWAYS use WRITE block to create/modify files — NEVER show file content inside markdown code blocks
+- ALWAYS use SHELL block for any git operation — never just show commands as text
+- When asked to update a file: WRITE the full updated content, then SHELL to git add + commit + push
+- Multiple WRITE and SHELL blocks are allowed in one response
+- Write a short summary outside the blocks explaining what you did
+- DO NOT show file contents in markdown code blocks — use WRITE blocks only`;
+
+// ─── Claude API Call ──────────────────────────────────────────────────────────
+function getTmuxTarget(sessionId) {
+  // If already has window/pane spec, use as-is
+  if (sessionId.includes(":")) return sessionId;
+  // Otherwise default to window 0, pane 0
+  return `${sessionId}:0.0`;
+}
+
+// ─── 14. tmuxSend — send text (and Enter) to the attached tmux pane ─────────
+//
+// MULTI-STEP DESIGN. Doing this in one shot ("send text + Enter together")
+// historically caused two problems:
+//
+//   Problem 1 (single-line):
+//     Claude Code's TUI would receive the Enter mid-paste and leave the
+//     text sitting in the input box with nothing happening.
+//   Solution:
+//     Send text with `-l` (literal) → sleep briefly → send Enter separately.
+//
+//   Problem 2 (multi-line):
+//     When the user sends a message containing newlines (e.g. a paragraph
+//     pasted from Slack), the literal text is interpreted by claude-code as
+//     a paste, and the TUI shows a collapsed "[Pasted text #1 +N lines]"
+//     placeholder. In this paste-mode UI, a single Enter often only confirms
+//     the paste (i.e. closes the placeholder) but does NOT submit the
+//     message — the user (or bot) has to press Enter a second time to
+//     actually send it.
+//   Solution:
+//     Detect newlines in the text. If multiline:
+//       - wait longer (0.8s) for the paste UI to finish settling
+//       - send Enter (closes the paste placeholder)
+//       - wait again (0.3s)
+//       - send Enter a second time (actually submits)
+//
+// After sending, we also record the current time in `lastUserInputAt` so
+// the polling loop knows to suppress permission detection for a few
+// seconds (see the echo-suppression guard in startTmuxPolling).
+function tmuxSend(text) {
+  const target = getTmuxTarget(currentTmuxSession);
+  const isMultiline = text.includes('\n');
+
+  // 1. Send the text as literal characters (-l ensures special chars like apostrophes,
+  //    Korean, etc. are transmitted verbatim without tmux trying to interpret them).
+  execSync(`tmux send-keys -t ${target} -l ${JSON.stringify(text)}`);
+
+  // 2. Give Claude Code's TUI a moment to fully receive the text before we press Enter.
+  //    Multiline text triggers claude-code's "paste" handling ([Pasted text #1 +N lines]),
+  //    which needs extra time to settle before Enter can submit.
+  execSync(`sleep ${isMultiline ? '0.8' : '0.3'}`);
+
+  // 3. Send Enter to submit.
+  execSync(`tmux send-keys -t ${target} Enter`);
+
+  // 4. For multiline input, claude-code shows the pasted text in a collapsed
+  //    "[Pasted text #1]" UI. The first Enter often just confirms/closes the
+  //    paste UI rather than submitting. Send a second Enter after a short
+  //    pause to actually submit the message.
+  if (isMultiline) {
+    execSync(`sleep 0.3`);
+    execSync(`tmux send-keys -t ${target} Enter`);
+  }
+
+  // 5. Record the time of this input so the polling loop can suppress permission
+  //    detection for a few seconds (prevents user text being flagged as a prompt).
+  lastUserInputAt = Date.now();
+}
+
+function tmuxCapture() {
+  const raw = execSync(
+    `tmux capture-pane -t ${getTmuxTarget(currentTmuxSession)} -p -S -1000`,
+    { encoding: "utf-8" }
+  );
+  return raw.replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, "").replace(/\x1b\][^\x07]*\x07/g, "");
+}
+
+async function runTask(client, channel, threadTs, userPrompt, existingMessages = []) {
+  const key = sessionKey(channel, threadTs);
+  sessions.set(key, { messages: existingMessages, aborted: false });
+
+  const detectedPaths = extractPaths(userPrompt);
+  if (detectedPaths.length > 0) {
+    await postStatus(client, channel, threadTs, `📂 Path: \`${detectedPaths.join(", ")}\` — Reading files…`);
+  }
+  await postStatus(client, channel, threadTs, `⚙️ *Working…*\n> ${userPrompt}`);
+
+  const fileContext = buildFileContext(detectedPaths);
+  const messages = [...existingMessages, { role: "user", content: userPrompt + fileContext }];
+
+  try {
+    const session = sessions.get(key);
+    if (session.aborted) return;
+
+    const stream = await anthropic.messages.stream({
+      model: MODEL,
+      max_tokens: 24000,
+      system: SYSTEM_PROMPT,
+      messages,
+    });
+
+    const response = await stream.finalMessage();
+    const rawText = response.content.filter(b => b.type === "text").map(b => b.text).join("\n").trim() || "_(no output)_";
+
+    const { cleaned: afterWrite, written } = parseAndApplyWrites(rawText);
+    const { cleaned: finalText, results: shellResults } = parseAndRunShell(afterWrite);
+
+    let summary = finalText;
+    if (written.length > 0) {
+      summary += `\n\n📝 *Saved files:*\n${written.map(f => `• \`${f}\``).join("\n")}`;
+    }
+    for (const r of shellResults) {
+      const icon = r.success ? "✅" : "❌";
+      summary += `\n\n${icon} *Shell output:*\n\`\`\`\n$ ${r.commands}\n${r.output}\n\`\`\``;
+    }
+
+    if (sessions.has(key)) {
+      sessions.get(key).messages = [...existingMessages, { role: "user", content: userPrompt }, { role: "assistant", content: rawText }];
+    }
+
+    await postWithActions(client, channel, threadTs, summary || "_Completed_");
+  } catch (err) {
+    console.error("API error:", err);
+    await postStatus(client, channel, threadTs, `❌ *Error:* ${err.message}`);
+    sessions.delete(key);
+  }
+}
+
+// ─── /claude command ──────────────────────────────────────────────────────────
+app.command("/claude", async ({ command, ack, client }) => {
+  await ack();
+  const task = command.text.trim();
+  if (!task) {
+    await client.chat.postEphemeral({ channel: command.channel_id, user: command.user_id,
+      text: "Usage: `/claude <task>`\nExamples:\n• `/claude /path/to/repo review the code`\n• `/claude /path/to/repo fix bug in main.py and push`"
+    });
+    return;
+  }
+  const initMsg = await client.chat.postMessage({ channel: command.channel_id, text: `🤖 *Claude session* — <@${command.user_id}> started this session` });
+  await runTask(client, command.channel_id, initMsg.ts, task);
+});
+
+// ─── Thread replies → continue session ───────────────────────────────────────
+app.message(async ({ message, client }) => {
+  if (message.subtype === "bot_message" || !message.thread_ts) return;
+
+  const text = message.text && message.text.trim();
+  if (!text) return;
+
+  // Inside tmux stream thread
+  if (currentTmuxSession && message.thread_ts === tmuxStreamTs && message.channel === tmuxStreamChannel) {
+
+    // "tmux-status" → show current output
+    if (text.toLowerCase() === "tmux-status") {
+      try {
+        const raw = tmuxCapture();
+        const stripped = raw.replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, "").replace(/\x1b\][^\x07]*\x07/g, "");
+        const output = stripped.trim().slice(-2800);
+        await client.chat.postMessage({
+          channel: message.channel,
+          thread_ts: tmuxStreamTs,
+          text: `📺 *Current output:*\n\`\`\`\n${output}\n\`\`\``,
+        });
+      } catch (err) {
+        await client.chat.postMessage({
+          channel: message.channel,
+          thread_ts: tmuxStreamTs,
+          text: `❌ Error: ${err.message}`,
+        });
+      }
+      return;
+    }
+    
+    // "status" → show claude-code /status output
+    if (text.toLowerCase() === "status") {
+      try {
+        const output = execSync(`tmux send-keys -t ${currentTmuxSession} '/status' Enter`, { encoding: "utf-8" });
+        await new Promise(r => setTimeout(r, 2000));
+        const raw = tmuxCapture();
+        const stripped = raw.replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, "").replace(/\x1b\][^\x07]*\x07/g, "");
+        await client.chat.postMessage({
+          channel: message.channel,
+          thread_ts: tmuxStreamTs,
+          text: `📊 *Status:*\n\`\`\`\n${stripped.trim().slice(-2800)}\n\`\`\``,
+        });
+      } catch (err) {
+        await client.chat.postMessage({
+          channel: message.channel,
+          thread_ts: tmuxStreamTs,
+          text: `❌ Error: ${err.message}`,
+        });
+      }
+      return;
+    }
+
+    // "? <question>" → Claude API call (no file reading, truncated output)
+    if (text.startsWith("?")) {
+      const prompt = text.slice(1).trim();
+
+      await postStatus(client, message.channel, message.thread_ts, `⚙️ *Working…*\n> ${prompt}`);
+
+      try {
+        const stream = await anthropic.messages.stream({
+          model: MODEL,
+          max_tokens: 3000,  // short answer
+          system: "You are a helpful assistant. Be concise. Answer in 3-5 sentences max unless code is required.",
+          messages: [{ role: "user", content: prompt }],
+        });
+        const response = await stream.finalMessage();
+        const answer = response.content.filter(b => b.type === "text").map(b => b.text).join("\n").trim();
+
+        await client.chat.postMessage({
+          channel: message.channel,
+          thread_ts: message.thread_ts,
+          text: answer.slice(0, 2800),  // max one message
+          mrkdwn: true,
+        });
+      } catch (err) {
+        await client.chat.postMessage({
+          channel: message.channel,
+          thread_ts: message.thread_ts,
+          text: `❌ Error: ${err.message}`,
+        });
+      }
+      return;
+    }
+
+    // Otherwise → send to tmux
+    awaitingPermission = false;
+
+    // Special key mapping: allow users to send special keystrokes by typing
+    // a keyword like "esc", "tab", "ctrl-c" instead of literal text.
+    // This is needed because tmuxSend() only sends text followed by Enter,
+    // so without this mapping, there's no way to send e.g. Escape to close
+    // claude-code's /status modal from Slack.
+    const SPECIAL_KEYS = {
+      "esc": "Escape",
+      "escape": "Escape",
+      "tab": "Tab",
+      "up": "Up",
+      "down": "Down",
+      "left": "Left",
+      "right": "Right",
+      "ctrl-c": "C-c",
+      "ctrl-d": "C-d",
+      "ctrl-l": "C-l",
+    };
+
+    const lower = text.toLowerCase();
+    if (SPECIAL_KEYS[lower]) {
+      const target = getTmuxTarget(currentTmuxSession);
+      execSync(`tmux send-keys -t ${target} ${SPECIAL_KEYS[lower]}`);
+      await client.chat.postMessage({
+        channel: message.channel,
+        thread_ts: tmuxStreamTs,
+        text: `⌨️ *Sent special key:* \`${SPECIAL_KEYS[lower]}\``,
+      });
+      return;
+    }
+
+    tmuxSend(text);
+    return;
+  }
+
+  // Regular Claude API session thread
+  const key = sessionKey(message.channel, message.thread_ts);
+  const session = sessions.get(key);
+  if (!session || !message.text) return;
+  await runTask(client, message.channel, message.thread_ts, text, session.messages);
+});
+
+// ─── Button: New Task / Exit Session ─────────────────────────────────────────
+app.action("new_task", async ({ body, ack, client }) => {
+  await ack();
+  const { channel, threadTs } = JSON.parse(body.actions[0].value);
+  await postStatus(client, channel, threadTs, "💬 Please input next task!");
+});
+
+app.action("exit_session", async ({ body, ack, client }) => {
+  await ack();
+  const { channel, threadTs } = JSON.parse(body.actions[0].value);
+  const key = sessionKey(channel, threadTs);
+  const session = sessions.get(key);
+  if (session) { session.aborted = true; sessions.delete(key); }
+  await postStatus(client, channel, threadTs, "👋 *Session ended.* Use `/claude <task>` to start a new one.");
+});
+
+(async () => {
+  await app.start();
+  console.log("⚡ Claude ↔ Slack running! (read + write + shell + tmux enabled)");
+
+  // Start the periodic monitoring report watcher. Runs in the background
+  // forever; only emits messages when a /tmux-connect target is set AND
+  // the report file's mtime has changed since the last check.
+  startMonitoringPoll(app.client);
+
+  // Auto-reconnect on unexpected crash
+  process.on("uncaughtException", async (err) => {
+    console.error("Uncaught exception:", err.message);
+    if (err.message.includes("Unhandled event")) {
+      console.log("Restarting in 5 seconds...");
+      setTimeout(() => process.exit(1), 5000);
+    }
+  });
+})();
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  DAILY QUOTE SCHEDULER  (capability #4)
+// ═══════════════════════════════════════════════════════════════════════════
+//
+//  GOAL
+//  ----
+//  Post one short inspirational quote to a dedicated #quote channel three
+//  times a day (07:00 / 13:00 / 19:00 Korea time). Across one year's worth
+//  of sends (365 × 3 = 1095) no quote should repeat.
+//
+//  WHY A SHUFFLED POOL + CURSOR (instead of "pick a random quote each time")
+//  -------------------------------------------------------------------------
+//  Picking independently at random would eventually repeat quotes by chance
+//  (birthday paradox) long before a year is out. Instead we shuffle the whole
+//  pool ONCE, then walk through it in order, one quote per send. Because we
+//  never revisit an index until the pool is exhausted, every quote in a full
+//  pass is distinct. The pool here (quotes.json) has >1095 entries, so a full
+//  pass lasts more than a year; when it finally runs out we re-shuffle into a
+//  fresh order for the next pass.
+//
+//  WHY STATE IS WRITTEN TO DISK
+//  ----------------------------
+//  The shuffle order + current position must survive bot restarts (crash,
+//  redeploy, server reboot). If we kept them only in memory, every restart
+//  would reset the sequence and could repeat quotes. So after EACH send we
+//  persist { order, cursor } to quote-state.json. A missing/corrupt file
+//  simply triggers a fresh shuffle (the try/catch in loadState).
+//
+//  NOTE: this block lives AFTER the app.start() IIFE above. That's fine —
+//  cron.schedule() only REGISTERS the job; by the time it actually fires
+//  (07/13/19 KST) the Slack app is long since started and app.client works.
+const cron = require('node-cron');
+
+// The destination channel's ID (NOT its name). Find it via: right-click the
+// #quote channel → Copy link → the trailing "C..." segment. The bot must be
+// invited to this channel (/invite) or postMessage returns channel_not_found.
+const QUOTE_CHANNEL = 'C0B75H2HEQ6';                  // #quote channel ID
+
+// Where the shuffle order + cursor are persisted between sends/restarts.
+// path.join(__dirname, ...) keeps it next to index.js regardless of the
+// directory the bot was launched from. Recommend git-ignoring this file.
+const STATE_FILE = path.join(__dirname, 'quote-state.json');
+
+// The quote pool: an array of { q: "<quote text>", a: "<author>" }.
+// require() reads + parses the JSON once at startup. If the file is missing,
+// require THROWS here and the bot won't start — so quotes.json must exist in
+// the same folder as index.js.
+const POOL = require('./quotes.json');                // [{ q, a }, ...]  (>1095, de-duplicated)
+
+// Fisher–Yates shuffle: returns a NEW array that is a uniformly-random
+// permutation of the input (does not mutate the original). We shuffle an
+// array of indices into POOL, not POOL itself, so state.json stays tiny.
+function shuffle(arr) {
+  const a = [...arr];
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));    // random 0..i
+    [a[i], a[j]] = [a[j], a[i]];                       // swap
+  }
+  return a;
+}
+
+// Load persisted state, or initialize a fresh shuffled order on first run /
+// if the file is unreadable. [...POOL.keys()] = [0,1,2,...,POOL.length-1].
+function loadState() {
+  try { return JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')); }
+  catch { return { order: shuffle([...POOL.keys()]), cursor: 0 }; }
+}
+
+// Return the next quote and advance the cursor, persisting immediately.
+function nextQuote() {
+  const s = loadState();
+  if (s.cursor >= s.order.length) {                   // pool exhausted (>1 year)
+    s.order = shuffle([...POOL.keys()]);              // → re-shuffle for next pass
+    s.cursor = 0;
+  }
+  const quote = POOL[s.order[s.cursor]];              // pick by shuffled index
+  s.cursor += 1;
+  fs.writeFileSync(STATE_FILE, JSON.stringify(s));    // persist now (restart-safe)
+  return quote;
+}
+
+// Compose + post the message. Runs inside the cron callback below.
+async function sendQuote() {
+  const { q, a } = nextQuote();
+  await app.client.chat.postMessage({
+    channel: QUOTE_CHANNEL,
+    text: `🌅 *오늘의 명언*\n> ${q}\n> — ${a}`,
+  });
+}
+
+// Register the job. '0 7,13,19 * * *' = minute 0 of hours 7, 13, and 19,
+// every day. The timezone option pins those hours to Korea time regardless
+// of the server's own timezone. node-cron v4 auto-starts the task on
+// schedule() — no separate .start() call is needed.
+cron.schedule('0 7,13,19 * * *', sendQuote, { timezone: 'Asia/Seoul' });
