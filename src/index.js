@@ -1001,7 +1001,7 @@ async function sendQuote() {
   const { q, a } = nextQuote();
   await app.client.chat.postMessage({
     channel: QUOTE_CHANNEL,
-    text: `🌅 *오늘의 명언*\n> ${q}\n> — ${a}`,
+    text: `🌅 *Today's Quotes*\n> ${q}\n> — ${a}`,
   });
 }
 
